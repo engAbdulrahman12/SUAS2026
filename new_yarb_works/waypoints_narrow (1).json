@@ -1,0 +1,34 @@
+{
+  "description": "KAU narrow tall rectangle — SITL test",
+  "default_laps": 1,
+  "waypoints": [
+    {
+      "lat": 21.4964405,
+      "lon": 39.2452602,
+      "alt": 10.0,
+      "name": "WP1"
+    },
+    {
+      "lat": 21.4964605,
+      "lon": 39.2454144,
+      "alt": 10.0,
+      "name": "WP2"
+    },
+    {
+      "lat": 21.4964842,
+      "lon": 39.2455874,
+      "alt": 10.0,
+      "name": "WP3"
+    }
+  ],
+  "search_start": {
+    "lat": 21.4967575,
+    "lon": 39.2465101,
+    "alt": 10.0
+  },
+  "search_end": {
+    "lat": 21.4964106,
+    "lon": 39.2465919,
+    "alt": 10.0
+  }
+}
