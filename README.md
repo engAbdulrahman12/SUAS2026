@@ -1,2 +1,2 @@
 # SUAS2026
-for suas team
+## official github repo for Tactical Drag Team 2026

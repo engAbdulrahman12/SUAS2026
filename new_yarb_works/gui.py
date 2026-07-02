@@ -4,12 +4,37 @@ Two tabs:
   • Mission  — lap waypoints loaded from JSON or typed manually.
   • Search   — two corner coordinates defining the rectangle search area.
                The drone flies corner-1 → corner-2 in a straight line, then RTL.
+
+Built on CustomTkinter (not raw ttk): widgets are rasterized as anti-aliased
+images rather than native OS primitives, so corners/hover states render
+properly, and it handles Windows DPI awareness internally — fixes the
+blurry/pixelated scaling you get from plain tkinter on >100% display scaling.
 """
 import json
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
 from dataclasses import dataclass
 import config
+
+ctk.set_appearance_mode("dark")
+
+# ── Design tokens ────────────────────────────────────────────────
+FONT        = "Segoe UI"
+BG          = "#15181f"
+CARD        = "#1c2029"
+CARD_ALT    = "#20242e"
+BORDER      = "#2a2f3a"
+TEXT        = "#e5e7eb"
+TEXT_MUTED  = "#8b92a3"
+PRIMARY     = "#4f46e5"
+PRIMARY_HV  = "#4338ca"
+SUCCESS     = "#16a34a"
+SUCCESS_HV  = "#15803d"
+NEUTRAL     = "#2a2f3a"
+NEUTRAL_HV  = "#353b48"
+ACCENT_S    = "#10b981"
+ACCENT_E    = "#ef4444"
 
 
 @dataclass
@@ -22,117 +47,210 @@ class MissionParams:
     confirmed:    bool = False
 
 
+def _entry(parent, width=180, **kw):
+    return ctk.CTkEntry(parent, width=width, height=32, corner_radius=6,
+                        fg_color=CARD_ALT, border_color=BORDER, border_width=1,
+                        text_color=TEXT, font=(FONT, 12), **kw)
+
+
 class MissionGUI:
     def __init__(self):
         self.result = MissionParams([], 0, config.default_uri(), None, None, False)
-        self.rows   = []
-        self.root   = tk.Tk()
+        self.rows        = []   # list of (lat_e, lon_e, alt_e, name_e)
+        self.row_frames  = []
+
+        self.root = ctk.CTk()
         self.root.title("SUAS 2026 — Mission Planner")
-        self.root.geometry("920x640")
+        self.root.geometry("1000x700")
+        self.root.configure(fg_color=BG)
         self._build()
         self.root.mainloop()
 
-    # ── Top banner + connection bar ───────────────────────────
+    # ── Layout root ────────────────────────────────────────────
 
     def _build(self):
-        mode     = "SIMULATION" if config.TEST_FLAG else "REAL DRONE"
-        home_str = (f"{config.HOME_LAT:.7f}, {config.HOME_LON:.7f}"
-                    if config.HOME_LAT is not None else "AUTO from GPS")
-        banner   = f"{mode}  |  Default alt: {config.MISSION_ALT:.1f} m AGL  |  Home: {home_str}"
-        tk.Label(self.root, text=banner, bg="#2563eb", fg="white",
-                 font=("Segoe UI", 10, "bold"), pady=8).pack(fill="x")
+        self._build_header()
 
-        # Connection bar
-        conn = tk.LabelFrame(self.root, text="Connection", padx=8, pady=4)
-        conn.pack(fill="x", padx=10, pady=(6, 0))
-        tk.Label(conn, text="Port / URI:").pack(side="left")
+        body = ctk.CTkFrame(self.root, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        self._build_connection_card(body)
+
+        self.tabs = ctk.CTkTabview(
+            body, fg_color=CARD, segmented_button_fg_color=CARD_ALT,
+            segmented_button_selected_color=PRIMARY,
+            segmented_button_selected_hover_color=PRIMARY_HV,
+            segmented_button_unselected_color=CARD_ALT,
+            text_color=TEXT, corner_radius=10)
+        self.tabs.pack(fill="both", expand=True, pady=(14, 0))
+        self.tabs.add("Mission Waypoints")
+        self.tabs.add("Search Area")
+        self._build_mission_tab(self.tabs.tab("Mission Waypoints"))
+        self._build_search_tab(self.tabs.tab("Search Area"))
+
+        self._build_footer(body)
+
+    def _build_header(self):
+        header = ctk.CTkFrame(self.root, fg_color="#0d0f14", corner_radius=0, height=64)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        inner = ctk.CTkFrame(header, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=22)
+
+        left = ctk.CTkFrame(inner, fg_color="transparent")
+        left.pack(side="left", fill="y")
+        ctk.CTkLabel(left, text="SUAS 2026", text_color="white",
+                    font=(FONT, 16, "bold")).pack(side="left", pady=16)
+        ctk.CTkLabel(left, text="  Mission Planner", text_color=TEXT_MUTED,
+                    font=(FONT, 13)).pack(side="left", pady=16)
+
+        right = ctk.CTkFrame(inner, fg_color="transparent")
+        right.pack(side="right", fill="y")
+
+        is_sim = bool(config.TEST_FLAG)
+        badge_bg  = "#1e3a5f" if is_sim else "#5f2e1e"
+        badge_fg  = "#7dd3fc" if is_sim else "#fdba74"
+        mode_txt  = "● SIMULATION" if is_sim else "● REAL DRONE"
+
+        home_str = (f"{config.HOME_LAT:.5f}, {config.HOME_LON:.5f}"
+                    if config.HOME_LAT is not None else "auto (GPS)")
+        ctk.CTkLabel(right, text=f"Alt {config.MISSION_ALT:.1f} m AGL   ·   Home: {home_str}",
+                    text_color=TEXT_MUTED, font=(FONT, 11)).pack(side="left", padx=(0, 14))
+
+        badge = ctk.CTkLabel(right, text=mode_txt, text_color=badge_fg, fg_color=badge_bg,
+                             corner_radius=6, font=(FONT, 11, "bold"), padx=10, pady=4)
+        badge.pack(side="left")
+
+    def _build_connection_card(self, parent):
+        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=10)
+        card.pack(fill="x")
+        pad = ctk.CTkFrame(card, fg_color="transparent")
+        pad.pack(fill="x", padx=18, pady=14)
+
+        ctk.CTkLabel(pad, text="CONNECTION", text_color=TEXT_MUTED,
+                    font=(FONT, 10, "bold")).grid(row=0, column=0, columnspan=6,
+                                                   sticky="w", pady=(0, 10))
+
+        ctk.CTkLabel(pad, text="URI", text_color=TEXT, font=(FONT, 12)).grid(
+            row=1, column=0, sticky="w", padx=(0, 8))
         self.uri_var = tk.StringVar(value=config.default_uri())
-        tk.Entry(conn, textvariable=self.uri_var, width=26).pack(side="left", padx=4)
-        for label, uri in [("SITL",  "tcp:127.0.0.1:5762"),
-                            ("Drone", "udp:0.0.0.0:14551"),
-                            ("COM6",  "COM6"), ("COM3", "COM3")]:
-            tk.Button(conn, text=label, width=5,
-                      command=lambda u=uri: self.uri_var.set(u)).pack(side="left", padx=2)
-        tk.Label(conn, text="  ℹ Run start_mavproxy.bat first, then connect MP to UDP:14550",
-                 fg="#1d4ed8", font=("Segoe UI", 9)).pack(side="left", padx=6)
+        _entry(pad, width=230, textvariable=self.uri_var).grid(
+            row=1, column=1, padx=(0, 16))
 
-        # Tabs
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=10, pady=6)
-        self._build_mission_tab(nb)
-        self._build_search_tab(nb)
+        for i, (label, uri) in enumerate([("SITL", "tcp:127.0.0.1:5762"),
+                                           ("Drone", "udp:0.0.0.0:14552"),
+                                           ("COM6", "COM6"), ("COM3", "COM3")]):
+            ctk.CTkButton(pad, text=label, width=56, height=28, corner_radius=6,
+                         fg_color=NEUTRAL, hover_color=NEUTRAL_HV, text_color=TEXT,
+                         font=(FONT, 10, "bold"),
+                         command=lambda u=uri: self.uri_var.set(u)).grid(
+                row=1, column=2 + i, padx=3)
 
-        # Bottom buttons
-        btns = tk.Frame(self.root, pady=6)
-        btns.pack(fill="x", padx=10)
-        tk.Button(btns, text="Cancel", command=self.root.destroy).pack(side="right", padx=4)
-        tk.Button(btns, text="▶  Start Mission", command=self._confirm,
-                  bg="#22c55e", fg="white",
-                  font=("Segoe UI", 10, "bold"), padx=10).pack(side="right")
+        ctk.CTkLabel(pad, text="ℹ  Run start_mavproxy.bat first, then point Mission Planner at UDP:14550",
+                    text_color=TEXT_MUTED, font=(FONT, 10)).grid(
+            row=2, column=0, columnspan=7, sticky="w", pady=(10, 0))
+
+    def _build_footer(self, parent):
+        btns = ctk.CTkFrame(parent, fg_color="transparent")
+        btns.pack(fill="x", pady=(14, 0))
+        ctk.CTkButton(btns, text="▶  Start Mission", height=42, corner_radius=8,
+                     fg_color=SUCCESS, hover_color=SUCCESS_HV, text_color="white",
+                     font=(FONT, 13, "bold"), command=self._confirm).pack(
+            side="right")
+        ctk.CTkButton(btns, text="Cancel", height=42, width=90, corner_radius=8,
+                     fg_color="transparent", hover_color=NEUTRAL, text_color=TEXT_MUTED,
+                     border_width=1, border_color=BORDER, font=(FONT, 12),
+                     command=self.root.destroy).pack(side="right", padx=(0, 10))
 
     # ── Mission tab ───────────────────────────────────────────
 
-    def _build_mission_tab(self, nb):
-        frame = tk.Frame(nb)
-        nb.add(frame, text="  Mission Waypoints  ")
+    def _build_mission_tab(self, tab):
+        tab.configure(fg_color="transparent")
 
-        top = tk.Frame(frame, pady=6)
-        top.pack(fill="x")
-        tk.Button(top, text="📂 Load JSON", command=self._load_json).pack(side="left")
-        tk.Label(top, text="    Laps:").pack(side="left")
+        toolbar = ctk.CTkFrame(tab, fg_color=CARD_ALT, corner_radius=8)
+        toolbar.pack(fill="x", padx=4, pady=(4, 10))
+        tb = ctk.CTkFrame(toolbar, fg_color="transparent")
+        tb.pack(fill="x", padx=12, pady=10)
+
+        ctk.CTkButton(tb, text="📂  Load JSON", height=32, corner_radius=6,
+                     fg_color=PRIMARY, hover_color=PRIMARY_HV, font=(FONT, 12, "bold"),
+                     command=self._load_json).pack(side="left")
+
+        ctk.CTkFrame(tb, fg_color=BORDER, width=1, height=24).pack(
+            side="left", padx=16)
+
+        ctk.CTkLabel(tb, text="Laps", text_color=TEXT, font=(FONT, 12)).pack(side="left")
         self.laps_var = tk.IntVar(value=config.DEFAULT_LAPS)
-        tk.Spinbox(top, from_=1, to=20, textvariable=self.laps_var, width=5).pack(side="left")
-        tk.Button(top, text="+ Add WP",    command=self._add_row).pack(side="left", padx=8)
-        tk.Button(top, text="Remove Last", command=self._remove_last).pack(side="left")
-        tk.Button(top, text="Clear All",   command=self._clear).pack(side="left", padx=4)
+        laps_lbl = ctk.CTkLabel(tb, textvariable=self.laps_var, width=28, height=28,
+                                fg_color=CARD, corner_radius=6, text_color=TEXT,
+                                font=(FONT, 12, "bold"))
+        laps_lbl.pack(side="left", padx=8)
+        ctk.CTkButton(tb, text="−", width=28, height=28, corner_radius=6,
+                     fg_color=NEUTRAL, hover_color=NEUTRAL_HV,
+                     command=lambda: self.laps_var.set(max(1, self.laps_var.get() - 1))
+                     ).pack(side="left", padx=(0, 2))
+        ctk.CTkButton(tb, text="+", width=28, height=28, corner_radius=6,
+                     fg_color=NEUTRAL, hover_color=NEUTRAL_HV,
+                     command=lambda: self.laps_var.set(min(20, self.laps_var.get() + 1))
+                     ).pack(side="left", padx=(0, 16))
 
-        hdr = tk.Frame(frame)
-        hdr.pack(fill="x")
-        for col, (text, w) in enumerate([("#", 4), ("Latitude", 20), ("Longitude", 20),
-                                          ("Alt AGL (m)", 12), ("Name", 14)]):
-            tk.Label(hdr, text=text, width=w, anchor="w",
-                     font=("Segoe UI", 9, "bold")).grid(row=0, column=col, padx=2)
+        ctk.CTkButton(tb, text="+ Add Row", height=32, corner_radius=6,
+                     fg_color=NEUTRAL, hover_color=NEUTRAL_HV, font=(FONT, 11),
+                     command=self._add_row).pack(side="left", padx=3)
+        ctk.CTkButton(tb, text="Remove Last", height=32, corner_radius=6,
+                     fg_color=NEUTRAL, hover_color=NEUTRAL_HV, font=(FONT, 11),
+                     command=self._remove_last).pack(side="left", padx=3)
+        ctk.CTkButton(tb, text="Clear All", height=32, corner_radius=6,
+                     fg_color=NEUTRAL, hover_color=NEUTRAL_HV, font=(FONT, 11),
+                     command=self._clear).pack(side="left", padx=3)
 
-        outer  = tk.Frame(frame)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, borderwidth=0)
-        vsb    = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        self.table = tk.Frame(canvas)
-        self.table.bind("<Configure>",
-                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.table, anchor="nw")
+        table_card = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=10)
+        table_card.pack(fill="both", expand=True, padx=4)
+
+        hdr = ctk.CTkFrame(table_card, fg_color="transparent")
+        hdr.pack(fill="x", padx=16, pady=(12, 4))
+        for col, (text, w) in enumerate([("#", 30), ("LATITUDE", 190), ("LONGITUDE", 190),
+                                          ("ALT AGL (m)", 110), ("NAME", 140)]):
+            ctk.CTkLabel(hdr, text=text, width=w, anchor="w", text_color=TEXT_MUTED,
+                        font=(FONT, 10, "bold")).grid(row=0, column=col, padx=4)
+
+        self.scroll = ctk.CTkScrollableFrame(table_card, fg_color="transparent",
+                                             scrollbar_button_color=NEUTRAL,
+                                             scrollbar_button_hover_color=NEUTRAL_HV)
+        self.scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         for _ in range(4):
             self._add_row()
 
     def _add_row(self, lat="", lon="", alt="", name=""):
-        idx   = len(self.rows) + 1
-        tk.Label(self.table, text=str(idx), width=4, anchor="w").grid(row=idx, column=0, pady=1)
-        lat_e  = tk.Entry(self.table, width=20); lat_e.insert(0, lat)
-        lon_e  = tk.Entry(self.table, width=20); lon_e.insert(0, lon)
-        alt_e  = tk.Entry(self.table, width=12); alt_e.insert(0, alt)
-        name_e = tk.Entry(self.table, width=14); name_e.insert(0, name)
+        idx = len(self.rows) + 1
+        row_bg = CARD if idx % 2 else CARD_ALT
+        row = ctk.CTkFrame(self.scroll, fg_color=row_bg, corner_radius=6)
+        row.pack(fill="x", pady=2)
+
+        ctk.CTkLabel(row, text=str(idx), width=30, text_color=TEXT_MUTED,
+                    font=(FONT, 10, "bold")).grid(row=0, column=0, padx=(6, 4), pady=6)
+        lat_e  = _entry(row, width=190); lat_e.insert(0, lat)
+        lon_e  = _entry(row, width=190); lon_e.insert(0, lon)
+        alt_e  = _entry(row, width=110); alt_e.insert(0, alt)
+        name_e = _entry(row, width=140); name_e.insert(0, name)
         for col, w in enumerate([lat_e, lon_e, alt_e, name_e], 1):
-            w.grid(row=idx, column=col, padx=2, pady=1)
+            w.grid(row=0, column=col, padx=4, pady=6)
+
         self.rows.append((lat_e, lon_e, alt_e, name_e))
+        self.row_frames.append(row)
 
     def _remove_last(self):
         if not self.rows:
             return
-        entries = self.rows.pop()
-        row = int(entries[0].grid_info()["row"])
-        for w in self.table.grid_slaves(row=row):
-            w.destroy()
+        self.rows.pop()
+        self.row_frames.pop().destroy()
 
     def _clear(self):
-        for entries in self.rows:
-            row = int(entries[0].grid_info()["row"])
-            for w in self.table.grid_slaves(row=row):
-                w.destroy()
+        for row in self.row_frames:
+            row.destroy()
         self.rows.clear()
+        self.row_frames.clear()
 
     def _load_json(self):
         path = filedialog.askopenfilename(title="Select waypoints JSON",
@@ -151,80 +269,83 @@ class MissionGUI:
             for wp in wps:
                 self._add_row(str(wp.get("lat", "")), str(wp.get("lon", "")),
                               str(wp.get("alt", "")), str(wp.get("name", "")))
-            # Load search corners if present in the JSON
             if "search_start" in data:
                 s = data["search_start"]
-                self.s_lat1.delete(0, tk.END); self.s_lat1.insert(0, str(s.get("lat","")))
-                self.s_lon1.delete(0, tk.END); self.s_lon1.insert(0, str(s.get("lon","")))
-                self.s_alt1.delete(0, tk.END); self.s_alt1.insert(0, str(s.get("alt","")))
+                self.s_lat1.delete(0, tk.END); self.s_lat1.insert(0, str(s.get("lat", "")))
+                self.s_lon1.delete(0, tk.END); self.s_lon1.insert(0, str(s.get("lon", "")))
+                self.s_alt1.delete(0, tk.END); self.s_alt1.insert(0, str(s.get("alt", "")))
             if "search_end" in data:
                 e = data["search_end"]
-                self.s_lat2.delete(0, tk.END); self.s_lat2.insert(0, str(e.get("lat","")))
-                self.s_lon2.delete(0, tk.END); self.s_lon2.insert(0, str(e.get("lon","")))
-                self.s_alt2.delete(0, tk.END); self.s_alt2.insert(0, str(e.get("alt","")))
+                self.s_lat2.delete(0, tk.END); self.s_lat2.insert(0, str(e.get("lat", "")))
+                self.s_lon2.delete(0, tk.END); self.s_lon2.insert(0, str(e.get("lon", "")))
+                self.s_alt2.delete(0, tk.END); self.s_alt2.insert(0, str(e.get("alt", "")))
             messagebox.showinfo("Loaded", f"Loaded {len(wps)} waypoints from:\n{path}")
         except Exception as e:
             messagebox.showerror("Load error", str(e))
 
     # ── Search tab ────────────────────────────────────────────
 
-    def _build_search_tab(self, nb):
-        frame = tk.Frame(nb)
-        nb.add(frame, text="  Search Area  ")
+    def _build_search_tab(self, tab):
+        tab.configure(fg_color="transparent")
 
-        tk.Label(frame,
-                 text="Set S = midpoint of the entry side, E = midpoint of the exit side.\n"
-                      "The drone flies straight from S through the center to E, then RTL.\n"
-                      "Leave both blank to skip the search.",
-                 justify="left", fg="#374151", pady=8).pack(anchor="w", padx=16)
+        info = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=10)
+        info.pack(fill="x", padx=4, pady=(4, 10))
+        ipad = ctk.CTkFrame(info, fg_color="transparent")
+        ipad.pack(fill="x", padx=18, pady=14)
+        ctk.CTkLabel(ipad, text="Set S = midpoint of the entry side, E = midpoint of the exit side.",
+                    text_color=TEXT, font=(FONT, 12), anchor="w").pack(fill="x")
+        ctk.CTkLabel(ipad,
+                    text="The drone flies straight from S through the center to E, then RTL. Leave both blank to skip.",
+                    text_color=TEXT_MUTED, font=(FONT, 11), anchor="w").pack(fill="x", pady=(3, 0))
 
-        # Visual diagram
-        diag = tk.Canvas(frame, width=300, height=130, bg="#f3f4f6", highlightthickness=1,
-                         highlightbackground="#d1d5db")
-        diag.pack(padx=16, pady=(0, 10), anchor="w")
-        diag.create_rectangle(40, 25, 260, 105, outline="#6b7280", width=2)
-        diag.create_oval(30, 57, 50, 77, fill="#22c55e", outline="")
-        diag.create_text(18, 50, text="S", font=("Segoe UI", 11, "bold"), fill="#059669")
-        diag.create_oval(250, 57, 270, 77, fill="#ef4444", outline="")
-        diag.create_text(278, 50, text="E", font=("Segoe UI", 11, "bold"), fill="#dc2626")
-        diag.create_line(40, 67, 260, 67, fill="#3b82f6", width=3, arrow=tk.LAST)
-        diag.create_text(150, 118, text="S and E are midpoints of the short sides",
-                         font=("Segoe UI", 8), fill="#374151")
+        diagram_card = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=10)
+        diagram_card.pack(fill="x", padx=4, pady=(0, 10))
+        dpad = ctk.CTkFrame(diagram_card, fg_color="transparent")
+        dpad.pack(pady=14)
+        diag = tk.Canvas(dpad, width=320, height=110, bg=CARD, highlightthickness=0)
+        diag.pack()
+        diag.create_rectangle(40, 20, 280, 90, outline=BORDER, width=2, fill=CARD_ALT)
+        diag.create_oval(30, 45, 50, 65, fill=ACCENT_S, outline="")
+        diag.create_text(18, 40, text="S", font=(FONT, 11, "bold"), fill=ACCENT_S)
+        diag.create_oval(270, 45, 290, 65, fill=ACCENT_E, outline="")
+        diag.create_text(300, 40, text="E", font=(FONT, 11, "bold"), fill=ACCENT_E)
+        diag.create_line(40, 55, 280, 55, fill=PRIMARY, width=3, arrow=tk.LAST)
+        diag.create_text(160, 100, text="S and E are midpoints of the short sides",
+                         font=(FONT, 8), fill=TEXT_MUTED)
 
-        # Input grid
-        grid = tk.Frame(frame, padx=16)
-        grid.pack(anchor="w")
+        input_card = ctk.CTkFrame(tab, fg_color=CARD, corner_radius=10)
+        input_card.pack(fill="x", padx=4)
+        grid = ctk.CTkFrame(input_card, fg_color="transparent")
+        grid.pack(fill="x", padx=18, pady=16)
 
-        headers = ["", "Latitude", "Longitude", "Alt AGL (m)"]
-        for col, h in enumerate(headers):
-            tk.Label(grid, text=h, font=("Segoe UI", 9, "bold"),
-                     width=14, anchor="w").grid(row=0, column=col, padx=4, pady=2)
+        for col, h in enumerate(["", "LATITUDE", "LONGITUDE", "ALT AGL (m)"]):
+            ctk.CTkLabel(grid, text=h, font=(FONT, 10, "bold"), text_color=TEXT_MUTED,
+                        width=140, anchor="w").grid(row=0, column=col, padx=4, pady=(0, 8))
 
-        tk.Label(grid, text="S — Entry midpoint", anchor="w", width=14,
-                 fg="#059669").grid(row=1, column=0, padx=4, pady=4)
-        self.s_lat1 = tk.Entry(grid, width=14); self.s_lat1.grid(row=1, column=1, padx=4)
-        self.s_lon1 = tk.Entry(grid, width=14); self.s_lon1.grid(row=1, column=2, padx=4)
-        self.s_alt1 = tk.Entry(grid, width=10); self.s_alt1.grid(row=1, column=3, padx=4)
+        ctk.CTkLabel(grid, text="●  S — Entry", text_color=ACCENT_S, width=140,
+                    anchor="w", font=(FONT, 12, "bold")).grid(row=1, column=0, padx=4)
+        self.s_lat1 = _entry(grid, width=170); self.s_lat1.grid(row=1, column=1, padx=4, pady=5)
+        self.s_lon1 = _entry(grid, width=170); self.s_lon1.grid(row=1, column=2, padx=4, pady=5)
+        self.s_alt1 = _entry(grid, width=110); self.s_alt1.grid(row=1, column=3, padx=4, pady=5)
 
-        tk.Label(grid, text="E — Exit midpoint", anchor="w", width=14,
-                 fg="#dc2626").grid(row=2, column=0, padx=4, pady=4)
-        self.s_lat2 = tk.Entry(grid, width=14); self.s_lat2.grid(row=2, column=1, padx=4)
-        self.s_lon2 = tk.Entry(grid, width=14); self.s_lon2.grid(row=2, column=2, padx=4)
-        self.s_alt2 = tk.Entry(grid, width=10); self.s_alt2.grid(row=2, column=3, padx=4)
+        ctk.CTkLabel(grid, text="●  E — Exit", text_color=ACCENT_E, width=140,
+                    anchor="w", font=(FONT, 12, "bold")).grid(row=2, column=0, padx=4)
+        self.s_lat2 = _entry(grid, width=170); self.s_lat2.grid(row=2, column=1, padx=4, pady=5)
+        self.s_lon2 = _entry(grid, width=170); self.s_lon2.grid(row=2, column=2, padx=4, pady=5)
+        self.s_alt2 = _entry(grid, width=110); self.s_alt2.grid(row=2, column=3, padx=4, pady=5)
 
-        tk.Label(grid, text="(blank alt → uses Mission Alt from config)",
-                 fg="gray", font=("Segoe UI", 8)).grid(row=3, column=1, columnspan=3,
-                                                        sticky="w", padx=4)
+        ctk.CTkLabel(grid, text="Leave altitude blank to use Mission Alt from config.",
+                    text_color=TEXT_MUTED, font=(FONT, 10)).grid(
+            row=3, column=1, columnspan=3, sticky="w", padx=4, pady=(8, 0))
 
     def _parse_search(self):
-        """Return (start, end) tuples or (None, None) if search is skipped."""
         l1 = self.s_lat1.get().strip()
         o1 = self.s_lon1.get().strip()
         l2 = self.s_lat2.get().strip()
         o2 = self.s_lon2.get().strip()
 
         if not any([l1, o1, l2, o2]):
-            return None, None   # search skipped
+            return None, None
 
         if not all([l1, o1, l2, o2]):
             messagebox.showerror("Search Error",
@@ -252,7 +373,6 @@ class MissionGUI:
     # ── Confirm ───────────────────────────────────────────────
 
     def _confirm(self):
-        # Validate mission waypoints
         pts = []
         for i, (lat_e, lon_e, alt_e, _) in enumerate(self.rows, 1):
             ls, os_ = lat_e.get().strip(), lon_e.get().strip()
@@ -280,14 +400,11 @@ class MissionGUI:
             messagebox.showerror("Error", "Connection URI cannot be empty.")
             return
 
-        # Validate search area
         s_start, s_end = self._parse_search()
         if s_start == "ERROR":
             return
 
-        # Confirm dialog
-        search_line = ("straight line: corner1 → corner2"
-                       if s_start else "SKIPPED")
+        search_line = "straight line: corner1 → corner2" if s_start else "SKIPPED"
         msg = (f"Waypoints : {len(pts)}\n"
                f"Laps      : {self.laps_var.get()}\n"
                f"Search    : {search_line}\n"

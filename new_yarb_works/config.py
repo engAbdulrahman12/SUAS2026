@@ -11,7 +11,7 @@
 #    TEST_FLAG = 0  →  Real drone via MAVProxy UDP
 # ============================================================
 
-TEST_FLAG = 0           # 1 = SITL,  0 = real drone via MAVProxy
+TEST_FLAG = 1      # 1 = SITL,  0 = real drone via MAVProxy
 
 # --- Serial port (MAVProxy uses this — NOT the Python script) ---
 # Only needed in start_mavproxy.bat. Shown here for reference.
