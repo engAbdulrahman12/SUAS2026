@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pymavlink
+opencv-python
+pyserial
+
+# Optional — only needed if config.CAMERA_MODE = "rtsp" (AI tent/mannequin detection).
+# Leave commented out for webcam-only / bench testing.
+# ultralytics

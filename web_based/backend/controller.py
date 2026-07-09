@@ -1,0 +1,537 @@
+"""Mission controller — owns the drone connection, mission state machine,
+MAVProxy subprocess, and camera worker. Has ZERO knowledge of any GUI or
+web framework: it just calls `self._emit(event_dict)` for every log line,
+status change, or state update, and something else (app.py) is responsible
+for pushing those events out over a WebSocket.
+
+This is the safety-critical split: this module keeps flying the mission
+even if every browser tab is closed, frozen, or crashed. The browser is a
+window onto this process — never the thing keeping it alive.
+"""
+import os
+import shutil
+import site
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+
+import config
+
+
+def _guess_level(text: str) -> str:
+    """Same heuristic the old Tkinter log box used for raw print() output
+    (which carries no explicit level) — keeps colour-coding consistent."""
+    if any(x in text for x in ["✓", "OK", "ready", "accepted", "Armed", "complete", "onnected"]):
+        return "ok"
+    if any(x in text for x in ["Error", "error", "FAIL", "fail", "Timeout", "timeout"]):
+        return "error"
+    if any(x in text for x in ["warn", "WARN", "RTL", "Interrupt", "Abort"]):
+        return "warn"
+    return "plain"
+
+
+class _StdoutTee:
+    """Redirects stdout/stderr so every print() in flight.py / connection.py /
+    mission.py / vision.py (progress updates, GPS waiting, upload progress...)
+    reaches the browser log too — not just the explicit controller._log calls.
+    Still writes through to the real stdout so the server console shows it.
+    """
+    def __init__(self, controller, orig_stream):
+        self._ctl = controller
+        self._orig = orig_stream
+
+    def write(self, text):
+        if text.strip():
+            entry = {"type": "log", "text": text.rstrip(), "level": _guess_level(text),
+                     "ts": time.time()}
+            with self._ctl.lock:
+                self._ctl.log_history.append(entry)
+                self._ctl.log_history = self._ctl.log_history[-500:]
+            self._ctl._emit(entry)
+        self._orig.write(text)
+
+    def flush(self):
+        self._orig.flush()
+
+    def isatty(self):
+        return False
+
+
+@dataclass
+class MissionParams:
+    waypoints: list
+    laps: int
+    uri: str
+    search_corners: object   # [(lat,lon,alt) x4] or None to skip
+
+
+class MissionController:
+    def __init__(self):
+        self._emit_cb = lambda event: None   # set by app.py
+        self.lock = threading.RLock()
+
+        # connection / process state
+        self.conn = None
+        self.mav_proc = None
+        self.mission_thread = None
+
+        # camera
+        self.camera = None
+        self.cam_active = False
+        self.click_to_fly_enabled = False
+
+        # dedicated read-only connection for incoming Pi STATUSTEXT messages
+        # (separate socket from self.conn — never races the mission thread's
+        # recv_match() loop)
+        self.status_conn = None
+        self.status_listener_thread = None
+        self.status_listener_running = False
+
+        # mission flow control (mirrors the old GUI's Continue/Abort buttons)
+        self.continue_ev = threading.Event()
+        self.post_lap_choice = None
+        self.post_lap_ev = threading.Event()
+
+        # snapshot state for clients that (re)connect mid-mission
+        self.state = {
+            "sim": bool(config.TEST_FLAG),
+            "mav_running": False,
+            "mav_port": None,
+            "mission_running": False,
+            "awaiting_continue": False,
+            "awaiting_post_lap": False,
+            "search_available": False,
+            "click_to_fly_enabled": False,
+            "status_text": "Ready",
+            "status_level": "info",
+            "armed": False,
+            "cam_active": False,
+            "pi_link_active": False,
+            "pi_last_message": None,
+        }
+        self.log_history = []   # last N mission-log lines, for resync on reconnect
+        self.pi_log_history = []   # last N Pi STATUSTEXT messages, kept separate
+
+    # ── wiring ───────────────────────────────────────────────────
+    def set_emit(self, cb):
+        self._emit_cb = cb
+
+    def install_stdout_redirect(self):
+        """Call once at startup, after set_emit(). Mirrors every print()
+        from anywhere in the backend into the browser log stream."""
+        sys.stdout = _StdoutTee(self, sys.__stdout__)
+        sys.stderr = _StdoutTee(self, sys.__stderr__)
+
+    def _emit(self, event: dict):
+        self._emit_cb(event)
+
+    def _log(self, text: str, level: str = "plain"):
+        entry = {"type": "log", "text": text, "level": level, "ts": time.time()}
+        with self.lock:
+            self.log_history.append(entry)
+            self.log_history = self.log_history[-500:]
+        print(text)
+        self._emit(entry)
+
+    def _set_status(self, text: str, level: str = "info"):
+        with self.lock:
+            self.state["status_text"] = text
+            self.state["status_level"] = level
+        self._emit({"type": "status", "text": text, "level": level})
+
+    def _push_state(self):
+        with self.lock:
+            snap = dict(self.state)
+        self._emit({"type": "state", "state": snap})
+
+    # ── ports / mode ─────────────────────────────────────────────
+    @staticmethod
+    def list_ports():
+        try:
+            import serial.tools.list_ports
+            p = [x.device for x in serial.tools.list_ports.comports()]
+            return sorted(p) if p else []
+        except ImportError:
+            return []
+
+    def set_sim(self, sim: bool):
+        config.TEST_FLAG = 1 if sim else 0
+        with self.lock:
+            self.state["sim"] = sim
+        self._log(f"[MODE] {'SITL' if sim else 'Real Drone'}", "info")
+        self._push_state()
+
+    # ── MAVProxy ─────────────────────────────────────────────────
+    def _find_mav(self):
+        f = shutil.which("mavproxy.py")
+        if f:
+            return f
+        s = os.path.join(os.path.dirname(sys.executable), "Scripts", "mavproxy.py")
+        if os.path.exists(s):
+            return s
+        try:
+            for d in site.getsitepackages():
+                p = os.path.join(os.path.dirname(d), "Scripts", "mavproxy.py")
+                if os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+        return None
+
+    def start_mavproxy(self, port: str):
+        if self.mav_proc and self.mav_proc.poll() is None:
+            self._log("[MAVProxy] Already running.", "warn")
+            return
+        mp = self._find_mav()
+        if not mp:
+            self._log("[MAVProxy] Not found. Run: py -m pip install mavproxy", "error")
+            return
+        cmd = [sys.executable, mp, f"--master={port}",
+               f"--baudrate={config.BAUD_RATE}",
+               "--out=udp:127.0.0.1:14550",   # Mission Planner
+               "--out=udp:127.0.0.1:14552",   # this app's control connection
+               "--out=udp:127.0.0.1:14553"]   # dedicated read-only Pi status listener
+        self._log(f"[MAVProxy] {' '.join(cmd)}", "info")
+        try:
+            self.mav_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except Exception as e:
+            self._log(f"[MAVProxy] Failed: {e}", "error")
+            return
+        with self.lock:
+            self.state["mav_running"] = True
+            self.state["mav_port"] = port
+        self._push_state()
+        threading.Thread(target=self._mav_stream, daemon=True).start()
+
+    def _mav_stream(self):
+        for line in self.mav_proc.stdout:
+            line = line.rstrip()
+            if line:
+                tag = ("error" if "ERROR" in line.upper() else
+                       "warn" if "WARN" in line.upper() else "mav")
+                self._log(f"[MAV] {line}", tag)
+        self._log("[MAVProxy] Stopped.", "warn")
+        with self.lock:
+            self.state["mav_running"] = False
+        self._push_state()
+
+    def stop_mavproxy(self):
+        if self.mav_proc:
+            try:
+                self.mav_proc.terminate()
+            except Exception:
+                pass
+            self.mav_proc = None
+        with self.lock:
+            self.state["mav_running"] = False
+        self._push_state()
+
+    # ── Pi signalling (servo output) ────────────────────────────
+    def send_servo_command(self, pwm: int, label: str):
+        if self.conn is None:
+            self._log(f"[PI-CMD] Not connected — cannot send {label}.", "error")
+            return
+        from flight import set_servo
+        try:
+            set_servo(self.conn, config.PI_SIGNAL_SERVO_CHANNEL, pwm)
+            self._log(f"[PI-CMD] {label} → servo ch{config.PI_SIGNAL_SERVO_CHANNEL} = {pwm} us", "info")
+        except Exception as e:
+            self._log(f"[PI-CMD] {label} failed: {e}", "error")
+
+    # ── Pi status listener (dedicated read-only connection) ─────
+    _SEVERITY_TO_LEVEL = {0: "error", 1: "error", 2: "error", 3: "error",
+                          4: "warn", 5: "warn", 6: "info", 7: "plain"}
+
+    def start_status_listener(self, uri: str = None):
+        if self.status_listener_running:
+            return
+        target_uri = uri or config.default_status_uri()
+
+        def _run():
+            from connection import connect as _connect
+            try:
+                self.status_conn = _connect(uri=target_uri)
+            except Exception as e:
+                self._log(f"[PI-LINK] Status listener failed to connect ({target_uri}): {e}", "error")
+                return
+            self.status_listener_running = True
+            with self.lock:
+                self.state["pi_link_active"] = True
+            self._push_state()
+            self._log(f"[PI-LINK] Listening for Pi status on {target_uri}", "ok")
+            while self.status_listener_running:
+                try:
+                    msg = self.status_conn.recv_match(type="STATUSTEXT", blocking=True, timeout=2)
+                except Exception:
+                    break
+                if msg is None:
+                    continue
+                text = (msg.text or "").rstrip("\x00")
+                level = self._SEVERITY_TO_LEVEL.get(getattr(msg, "severity", 6), "info")
+                entry = {"type": "pi_status", "text": text, "level": level, "ts": time.time()}
+                with self.lock:
+                    self.pi_log_history.append(entry)
+                    self.pi_log_history = self.pi_log_history[-500:]
+                    self.state["pi_last_message"] = text
+                self._emit(entry)
+                print(f"[PI] {text}", file=sys.__stdout__)   # bypasses the tee — console only, not the mission log
+            with self.lock:
+                self.state["pi_link_active"] = False
+            self._push_state()
+
+        self.status_listener_thread = threading.Thread(target=_run, daemon=True)
+        self.status_listener_thread.start()
+
+    def stop_status_listener(self):
+        self.status_listener_running = False
+        if self.status_conn:
+            try:
+                self.status_conn.close()
+            except Exception:
+                pass
+        self.status_conn = None
+
+    # ── mission flow control (replaces Continue / post-lap dialog) ──
+    def user_continue(self):
+        with self.lock:
+            self.state["awaiting_continue"] = False
+        self._push_state()
+        self.continue_ev.set()
+
+    def choose_post_lap(self, choice: str):
+        """choice: 'home' or 'search'"""
+        self.post_lap_choice = choice
+        with self.lock:
+            self.state["awaiting_post_lap"] = False
+        self._push_state()
+        self.post_lap_ev.set()
+
+    def _ask_post_lap_choice(self, search_available: bool) -> str:
+        self.post_lap_ev.clear()
+        self.post_lap_choice = None
+        with self.lock:
+            self.state["awaiting_post_lap"] = True
+            self.state["search_available"] = search_available
+        self._push_state()
+        self._log("[MAIN] Laps complete — choose Return Home or Go to Search Area.", "info")
+        self.post_lap_ev.wait()
+        return self.post_lap_choice or "home"
+
+    # ── abort ────────────────────────────────────────────────────
+    def abort(self):
+        self._log("[ABORT] RTL commanded.", "warn")
+        self.click_to_fly_enabled = False
+        with self.lock:
+            self.state["click_to_fly_enabled"] = False
+        conn = self.conn
+        if conn:
+            def _do_rtl():
+                try:
+                    from flight import rtl_and_land
+                    rtl_and_land(conn)
+                except Exception as e:
+                    self._log(f"[ABORT] RTL error: {e}", "error")
+                finally:
+                    self.conn = None
+                    self._stop_camera()
+                    self.stop_status_listener()
+                    with self.lock:
+                        self.state["mission_running"] = False
+                        self.state["armed"] = False
+                    self._push_state()
+            threading.Thread(target=_do_rtl, daemon=True).start()
+        self._set_status("Aborted — RTL", "warn")
+
+    # ── camera ───────────────────────────────────────────────────
+    def _start_camera(self):
+        try:
+            from vision import CameraWorker
+            self.camera = CameraWorker()
+            self.camera.start()
+        except Exception as e:
+            self._log(f"[VISION] Camera failed to start: {e}", "error")
+            self.camera = None
+            return
+        self.cam_active = True
+        with self.lock:
+            self.state["cam_active"] = True
+        self._push_state()
+        info = ("RTSP feed + AI detection running." if config.CAMERA_MODE == "rtsp"
+                else "Webcam feed (CAMERA_MODE='webcam', no AI).")
+        self._emit({"type": "camera_info", "text": info})
+
+    def _stop_camera(self):
+        self.cam_active = False
+        self.click_to_fly_enabled = False
+        with self.lock:
+            self.state["click_to_fly_enabled"] = False
+            self.state["cam_active"] = False
+        self._push_state()
+        if self.camera:
+            self.camera.stop()
+        self.camera = None
+
+    def get_camera_frame(self):
+        if not self.cam_active or self.camera is None:
+            return None, []
+        return self.camera.get_frame()
+
+    def _enable_click_to_fly(self):
+        self.click_to_fly_enabled = True
+        with self.lock:
+            self.state["click_to_fly_enabled"] = True
+        self._push_state()
+        self._set_status("Mapping complete — click the camera feed to fly to that GPS point", "info")
+
+    def on_camera_click(self, px: float, py: float, w: int, h: int):
+        if not self.click_to_fly_enabled or self.conn is None:
+            return
+        self._log(f"[CLICK] pixel=({px:.0f},{py:.0f}) of {w}x{h}", "info")
+        from flight import fly_to_clicked_point
+        threading.Thread(target=fly_to_clicked_point,
+                         args=(self.conn, px, py, w, h), daemon=True).start()
+
+    def on_alt_key(self, direction: str):
+        if not self.click_to_fly_enabled or self.conn is None:
+            return
+        down_m = config.CLICK_ALT_STEP_M if direction == "d" else -config.CLICK_ALT_STEP_M
+        self._log(f"[ALT] {'Descend' if down_m > 0 else 'Climb'} {abs(down_m):.1f} m", "info")
+        from flight import nudge_body
+        threading.Thread(target=nudge_body, args=(self.conn, 0.0, 0.0, down_m), daemon=True).start()
+
+    # ── mission execution ────────────────────────────────────────
+    def start_mission(self, params: MissionParams):
+        if self.mission_thread and self.mission_thread.is_alive():
+            self._log("[MAIN] Mission already running.", "warn")
+            return
+        with self.lock:
+            self.state["mission_running"] = True
+        self._push_state()
+        self._set_status("Running…", "warn")
+        self.mission_thread = threading.Thread(target=self._run, args=(params,), daemon=True)
+        self.mission_thread.start()
+
+    def _run(self, params: MissionParams):
+        import config as cfg
+        from connection import connect, wait_gps
+        from flight import arm, fly_to, rtl_and_land, set_fixed_home, set_mode, set_param, takeoff
+        from mission import WP_FILE, build_items, save_waypoints_file, upload_mission
+
+        armed = False
+        manual_handoff = False
+        try:
+            # Phase 1 — save preview waypoints, wait for operator to verify
+            p0 = params.waypoints[0]
+            items = build_items(p0[0], p0[1], params.waypoints, params.laps,
+                                home_lat=p0[0], home_lon=p0[1])
+            save_waypoints_file(items)
+            self._log(f"✓ {WP_FILE} saved — load in MP PLAN tab to verify.", "ok")
+            self._log("After verifying waypoints in Mission Planner, click Continue →", "info")
+            self.continue_ev.clear()
+            with self.lock:
+                self.state["awaiting_continue"] = True
+            self._push_state()
+            self.continue_ev.wait()
+
+            # Phase 2 — connect
+            self._log(f"[CONN] Connecting → {params.uri}", "info")
+            self._set_status("Connecting…", "info")
+            conn = connect(uri=params.uri)
+            self.conn = conn
+            self.start_status_listener()
+            take_lat, take_lon = wait_gps(conn, simulation=bool(cfg.TEST_FLAG))
+            msg = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
+            alt_msl = (msg.alt / 1000.0) if msg else 0.0
+            home_lat = cfg.HOME_LAT or take_lat
+            home_lon = cfg.HOME_LON or take_lon
+            home_alt = cfg.HOME_ALT_MSL or alt_msl
+            self._log(f"[MAIN] Takeoff: {take_lat:.8f}, {take_lon:.8f}", "info")
+            self._log(f"[MAIN] HOME   : {home_lat:.8f}, {home_lon:.8f}", "info")
+
+            items = build_items(take_lat, take_lon, params.waypoints, params.laps,
+                                home_lat=home_lat, home_lon=home_lon)
+            save_waypoints_file(items)
+            set_param(conn, "RTL_ALT", cfg.MISSION_ALT * 100)
+            upload_mission(conn, items)
+            self._log("✓ Mission uploaded.", "ok")
+
+            # Phase 3 — fly
+            set_mode(conn, "GUIDED")
+            arm(conn)
+            armed = True
+            with self.lock:
+                self.state["armed"] = True
+            self._push_state()
+            self._set_status("Flying", "ok")
+            takeoff(conn, cfg.MISSION_ALT)
+            set_fixed_home(conn, home_lat, home_lon, home_alt)
+
+            for lap in range(1, params.laps + 1):
+                self._log(f"[MAIN] ── Lap {lap}/{params.laps} ──", "info")
+                prev = cfg.MISSION_ALT
+                for i, wp in enumerate(params.waypoints, 1):
+                    lat, lon, alt = wp
+                    if abs(alt - prev) > 0.5:
+                        self._log(f"[MAIN] Alt {prev:.1f}→{alt:.1f} m", "info")
+                        if not fly_to(conn, lat, lon, alt):
+                            raise TimeoutError(f"Alt-adjust timeout lap {lap} WP {i}")
+                    if not fly_to(conn, lat, lon, alt):
+                        raise TimeoutError(f"Timeout lap {lap} WP {i}")
+                    prev = alt
+
+            # Phase 4 — ask: home or search?
+            choice = self._ask_post_lap_choice(search_available=bool(params.search_corners))
+
+            if choice == "search" and params.search_corners:
+                from mission import build_straight_line_path
+                self._log("[SEARCH] Building straight-line pass along the longest side...", "info")
+                corners_latlon = [(c[0], c[1]) for c in params.search_corners]
+                search_alt = params.search_corners[0][2]
+                path = build_straight_line_path(corners_latlon, alt=search_alt)
+                self._log(f"[SEARCH] {len(path)}-point straight-line pass generated.", "info")
+
+                self._log("[SEARCH] Starting camera feed...", "info")
+                threading.Thread(target=self._start_camera, daemon=True).start()
+
+                self._log("[MAIN] ── Search / mapping ──", "info")
+                for i, (lat, lon, alt) in enumerate(path, 1):
+                    self._log(f"[SEARCH] Leg {i}/{len(path)}", "info")
+                    if not fly_to(conn, lat, lon, alt):
+                        raise TimeoutError(f"Search leg {i} timeout")
+                self._log("[SEARCH] Mapping complete ✓", "ok")
+
+                self._enable_click_to_fly()
+                self._log("[MAIN] Click the Camera Feed tab to fly to a marked object's real "
+                          "GPS position. Use RTL / Abort when ready to return home.", "info")
+                self._set_status("Manual visual approach — click camera feed, or RTL when done", "info")
+                manual_handoff = True
+                return
+
+            rtl_and_land(conn, home_lat, home_lon)
+            self._log("[MAIN] Mission complete ✓", "ok")
+            self._set_status("Mission complete ✓", "ok")
+
+        except Exception as e:
+            self._log(f"[MAIN] Error: {e}", "error")
+            self._set_status(f"Error: {e}", "error")
+            if armed and self.conn:
+                self._log("[MAIN] RTL for safety.", "warn")
+                try:
+                    from flight import rtl_and_land
+                    rtl_and_land(self.conn)
+                except Exception as re:
+                    self._log(f"[MAIN] RTL failed: {re}", "error")
+        finally:
+            with self.lock:
+                self.state["awaiting_continue"] = False
+            if not manual_handoff:
+                self.conn = None
+                self._stop_camera()
+                self.stop_status_listener()
+                with self.lock:
+                    self.state["mission_running"] = False
+                    self.state["armed"] = False
+            self._push_state()

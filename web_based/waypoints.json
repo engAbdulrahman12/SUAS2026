@@ -1,0 +1,34 @@
+{
+  "description": "Stillwater OK narrow tall rectangle — SITL test",
+  "default_laps": 1,
+  "waypoints": [
+    {
+      "lat": 36.2150434,
+      "lon": -96.0059415,
+      "alt": 10.0,
+      "name": "WP1"
+    },
+    {
+      "lat": 36.2150613,
+      "lon": -96.0057189,
+      "alt": 10.0,
+      "name": "WP2"
+    },
+    {
+      "lat": 36.2150793,
+      "lon": -96.0054963,
+      "alt": 10.0,
+      "name": "WP3"
+    }
+  ],
+  "search_start": {
+    "lat": 36.2151332,
+    "lon": -96.0048842,
+    "alt": 10.0
+  },
+  "search_end": {
+    "lat": 36.2147739,
+    "lon": -96.0048286,
+    "alt": 10.0
+  }
+}

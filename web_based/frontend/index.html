@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SUAS 2026 — Mission Planner</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand">SUAS<span class="brand-accent">/</span>2026</span>
+      <span class="brand-sub">Mission Planner</span>
+    </div>
+    <div class="topbar-right">
+      <span id="homeInfo" class="mono home-info"></span>
+      <span id="modeBadge" class="badge">SIMULATION</span>
+    </div>
+  </header>
+
+  <!-- Toolbar — connection setup (used once) + status rail (watched constantly) -->
+  <div class="toolbar-bar">
+    <div class="tb-group">
+      <span class="tb-label">Mode</span>
+      <button id="btnSim" class="btn btn-toggle active">SITL</button>
+      <button id="btnReal" class="btn btn-toggle">Real Drone</button>
+    </div>
+
+    <div class="tb-group tb-grow">
+      <span class="tb-label">URI</span>
+      <input id="uriInput" type="text" class="mono" value="tcp:127.0.0.1:5762">
+      <div class="tb-chips">
+        <button class="chip" data-uri="tcp:127.0.0.1:5762">SITL</button>
+        <button class="chip" data-uri="udp:0.0.0.0:14550">MP</button>
+        <button class="chip" data-uri="udp:0.0.0.0:14552">Script</button>
+      </div>
+    </div>
+
+    <div class="tb-group">
+      <span class="tb-label">COM</span>
+      <select id="portSelect" class="mono" disabled></select>
+      <button id="btnRefreshPorts" class="btn btn-icon" disabled title="Refresh ports">↻</button>
+    </div>
+
+    <div class="tb-group">
+      <button id="btnMav" class="btn btn-warn" disabled>Start MAVProxy</button>
+      <span id="mavStatus" class="muted small">Stopped</span>
+    </div>
+
+    <div class="tb-spacer"></div>
+
+    <!-- Status rail (annunciator strip) — always visible, any tab -->
+    <div class="rail">
+      <div class="rail-item" id="railBackend" title="Backend WebSocket connection">
+        <span class="rail-dot"></span><span class="rail-label">Backend</span>
+      </div>
+      <div class="rail-item" id="railMav" title="MAVProxy process">
+        <span class="rail-dot"></span><span class="rail-label">MAVProxy</span>
+      </div>
+      <div class="rail-item" id="railVehicle" title="Vehicle armed state">
+        <span class="rail-dot"></span><span class="rail-label">Armed</span>
+      </div>
+      <div class="rail-item" id="railCamera" title="Camera feed active">
+        <span class="rail-dot"></span><span class="rail-label">Camera</span>
+      </div>
+      <div class="rail-item" id="railPi" title="Pi status listener link">
+        <span class="rail-dot"></span><span class="rail-label">Pi Link</span>
+      </div>
+    </div>
+  </div>
+
+  <main class="body">
+
+    <!-- LEFT: the mission log owns the full column, guaranteed -->
+    <section class="left">
+      <div class="log-console">
+        <div class="console-header">
+          <span class="console-title">MISSION LOG</span>
+          <button id="btnClearLog" class="btn btn-mini">Clear</button>
+        </div>
+        <div id="logBox" class="log-box"></div>
+      </div>
+    </section>
+
+    <!-- RIGHT: tabs -->
+    <section class="right">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="wp">Mission Waypoints</button>
+        <button class="tab-btn" data-tab="search">Search Area</button>
+        <button class="tab-btn" data-tab="cam">Camera Feed</button>
+      </div>
+
+      <!-- Waypoints tab -->
+      <div class="tab-panel active" id="tab-wp">
+        <div class="toolbar">
+          <button id="btnLoadJson" class="btn btn-primary">📂 Load JSON</button>
+          <input id="jsonFile" type="file" accept=".json" style="display:none">
+          <div class="divider"></div>
+          <span class="field-label" style="width:auto;margin:0 6px 0 0;">Laps</span>
+          <button id="lapsMinus" class="btn btn-mini">−</button>
+          <span id="lapsVal" class="laps-val mono">1</span>
+          <button id="lapsPlus" class="btn btn-mini">+</button>
+          <div class="divider"></div>
+          <button id="btnAddRow" class="btn btn-mini">+ Add Row</button>
+          <button id="btnRemoveLast" class="btn btn-mini">Remove Last</button>
+          <button id="btnClearRows" class="btn btn-mini">Clear All</button>
+        </div>
+
+        <table class="wp-table">
+          <thead>
+            <tr><th class="col-idx">#</th><th>Latitude</th><th>Longitude</th><th class="col-alt">Alt AGL (m)</th><th class="col-name">Name</th></tr>
+          </thead>
+        </table>
+        <div id="wpRows" class="wp-rows"></div>
+      </div>
+
+      <!-- Search Area tab -->
+      <div class="tab-panel" id="tab-search">
+        <div class="card">
+          <p>4 corners define the search-area boundary — <b>A, B</b> are the entry edge, <b>C, D</b> are the exit edge.</p>
+          <p class="muted small">The drone flies one straight line down the centre of the area, along its longest side — then hands off to manual click-to-fly search.</p>
+          <p class="muted small">After the laps finish you'll be asked: Return Home, or run this search. Leave all fields blank to skip it entirely.</p>
+        </div>
+
+        <div class="card diagram-card">
+          <svg viewBox="0 0 360 130" class="search-diagram" aria-label="Search area corner diagram">
+            <rect x="40" y="18" width="280" height="90" rx="4" class="diag-box"/>
+            <line x1="46" y1="38" x2="314" y2="38" class="diag-line"/>
+            <line x1="46" y1="63" x2="314" y2="63" class="diag-line"/>
+            <line x1="46" y1="88" x2="314" y2="88" class="diag-line"/>
+            <circle cx="40" cy="18" r="7" class="diag-dot entry"/>
+            <text x="24" y="14" class="diag-label entry">A</text>
+            <circle cx="40" cy="108" r="7" class="diag-dot entry"/>
+            <text x="24" y="122" class="diag-label entry">D</text>
+            <circle cx="320" cy="18" r="7" class="diag-dot exit"/>
+            <text x="332" y="14" class="diag-label exit">B</text>
+            <circle cx="320" cy="108" r="7" class="diag-dot exit"/>
+            <text x="332" y="122" class="diag-label exit">C</text>
+            <text x="180" y="128" class="diag-caption">straight-line pass along the longest side</text>
+          </svg>
+        </div>
+
+        <div class="card">
+          <table class="search-table">
+            <thead><tr><th></th><th>Latitude</th><th>Longitude</th><th>Alt AGL (m)</th></tr></thead>
+            <tbody id="searchRows"></tbody>
+          </table>
+          <p class="muted small">Leave altitude blank to use Mission Alt from config.</p>
+        </div>
+      </div>
+
+      <!-- Camera tab -->
+      <div class="tab-panel" id="tab-cam">
+        <div class="card">
+          <p id="camInfo">Feed starts automatically when the drone reaches the search area.</p>
+          <p class="muted small">Click the feed to fly the drone to that real-world GPS point. Press U to climb / D to descend after clicking once.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-title-row">
+            <span class="card-title">PI COMPANION COMPUTER</span>
+            <button id="btnClearPiLog" class="btn btn-mini">Clear</button>
+          </div>
+          <div class="field-row" style="margin-bottom:10px; flex-wrap:wrap; gap:8px;">
+            <button id="btnPiRecordStart" class="btn btn-success" disabled>● Start Recording</button>
+            <button id="btnPiRecordStop" class="btn btn-danger" disabled>■ Stop Recording</button>
+            <button id="btnPiProcessStart" class="btn btn-primary" disabled>▶ Start Processing</button>
+          </div>
+          <p class="muted small mono" id="piSignalInfo"></p>
+          <div class="field-row">
+            <span id="piLinkDot" class="rail-dot standalone"></span>
+            <span id="piLastMsg" class="muted small">No Pi messages yet.</span>
+          </div>
+          <div id="piLogBox" class="log-box pi-log-box mono"></div>
+        </div>
+
+        <div class="cam-holder">
+          <img id="camImg" src="" alt="Camera feed inactive" tabindex="0">
+          <div id="camPlaceholder" class="cam-placeholder">Camera feed inactive</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footbar">
+    <button id="btnAbort" class="btn btn-danger btn-abort" disabled>⚠ RTL / ABORT</button>
+    <span id="statusLbl" class="status-lbl">Ready</span>
+    <div class="footbar-right">
+      <button id="btnContinue" class="btn btn-primary" style="display:none">Continue →</button>
+      <button id="btnStart" class="btn btn-success">▶ Start Mission</button>
+    </div>
+  </footer>
+
+  <!-- Post-lap choice modal -->
+  <div id="postLapModal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <h3>Laps complete — what next?</h3>
+      <p id="postLapNote" class="muted small" style="display:none">(No search area configured — Return Home only.)</p>
+      <div class="modal-actions">
+        <button id="btnGoHome" class="btn btn-neutral">Return Home (RTL)</button>
+        <button id="btnGoSearch" class="btn btn-primary">Go to Search Area</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm start modal -->
+  <div id="confirmModal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <h3>Confirm mission</h3>
+      <pre id="confirmText" class="mono"></pre>
+      <div class="modal-actions">
+        <button id="btnConfirmCancel" class="btn btn-neutral">Cancel</button>
+        <button id="btnConfirmGo" class="btn btn-success">Start mission</button>
+      </div>
+    </div>
+  </div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
