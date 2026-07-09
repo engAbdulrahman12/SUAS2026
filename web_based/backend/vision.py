@@ -24,14 +24,17 @@ except ImportError:
 
 
 class CameraWorker:
-    def __init__(self, simulation: bool = None):
-        # `simulation` kept as an optional legacy hint (unused for source
-        # selection) — the actual source comes from config.CAMERA_MODE,
-        # which is intentionally independent of TEST_FLAG. That way you can
-        # fly the real drone (TEST_FLAG=0) without a camera wired up yet and
-        # still get the webcam / no-AI feed by leaving CAMERA_MODE="webcam".
-        self.simulation = simulation
-        self.use_rtsp = (config.CAMERA_MODE == "rtsp")
+    def __init__(self, mode: str = None, source=None):
+        # mode/source let the caller override config.py at runtime (chosen
+        # from the website's UI) instead of always using the fixed config
+        # defaults. Falling back to config.* preserves the old behavior
+        # when nothing is passed in.
+        self.mode = mode or config.CAMERA_MODE
+        self.use_rtsp = (self.mode == "rtsp")
+        if source is not None:
+            self.source = source
+        else:
+            self.source = config.RTSP_URL if self.use_rtsp else config.WEBCAM_INDEX
         self._cap = None
         self._model = None
         self._thread = None
@@ -42,12 +45,10 @@ class CameraWorker:
 
     # ── lifecycle ────────────────────────────────────────────────
     def start(self) -> None:
-        if self.use_rtsp:
-            source, backend = config.RTSP_URL, cv2.CAP_FFMPEG
-        else:
-            source, backend = config.WEBCAM_INDEX, cv2.CAP_ANY
+        backend = cv2.CAP_FFMPEG if self.use_rtsp else cv2.CAP_ANY
+        source = self.source
 
-        print(f"[VISION] CAMERA_MODE={config.CAMERA_MODE!r} → opening {source}")
+        print(f"[VISION] mode={self.mode!r} → opening {source}")
         self._cap = cv2.VideoCapture(source, backend)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera source: {source}")
@@ -56,9 +57,13 @@ class CameraWorker:
             if YOLO is None:
                 print("[VISION] ultralytics not installed — feed only, no AI detection.")
             else:
-                print(f"[VISION] Loading AI model {config.AI_MODEL_PATH} ...")
-                self._model = YOLO(config.AI_MODEL_PATH)
-                print("[VISION] AI model ready ✓")
+                try:
+                    print(f"[VISION] Loading AI model {config.AI_MODEL_PATH} ...")
+                    self._model = YOLO(config.AI_MODEL_PATH)
+                    print("[VISION] AI model ready ✓")
+                except Exception as e:
+                    print(f"[VISION] AI model unavailable ({e}) — continuing with feed only, no AI detection.")
+                    self._model = None
         else:
             print("[VISION] Webcam mode — AI disabled (set config.CAMERA_MODE='rtsp' to enable).")
 

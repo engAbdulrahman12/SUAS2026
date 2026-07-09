@@ -15,7 +15,7 @@ TEST_FLAG = 1      # 1 = SITL,  0 = real drone via MAVProxy
 
 # --- Serial port (MAVProxy uses this — NOT the Python script) ---
 # Only needed in start_mavproxy.bat. Shown here for reference.
-COM_PORT  = "COM6"
+COM_PORT  = "COM3"
 BAUD_RATE = 57600
 
 # --- Connection URIs ---

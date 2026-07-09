@@ -153,8 +153,19 @@
       <!-- Camera tab -->
       <div class="tab-panel" id="tab-cam">
         <div class="card">
-          <p id="camInfo">Feed starts automatically when the drone reaches the search area.</p>
-          <p class="muted small">Click the feed to fly the drone to that real-world GPS point. Press U to climb / D to descend after clicking once.</p>
+          <div class="card-title">CAMERA SOURCE</div>
+          <div class="field-row" style="flex-wrap:wrap; gap:10px;">
+            <div class="btn-group">
+              <button id="btnCamWebcam" class="btn btn-toggle active">Webcam</button>
+              <button id="btnCamRtsp" class="btn btn-toggle">RTSP</button>
+            </div>
+            <input id="camSourceInput" type="text" class="mono" style="width:260px;" placeholder="0">
+            <button id="btnCamStart" class="btn btn-success">▶ Start Camera</button>
+            <button id="btnCamStop" class="btn btn-danger" disabled>■ Stop Camera</button>
+          </div>
+          <p class="muted small">Webcam: device index (usually <code class="mono">0</code>). RTSP: full stream URL. The feed runs independently of the mission — start it anytime to check it on the bench.</p>
+          <p id="camInfo" class="muted small"></p>
+          <p class="muted small">Click the feed to fly the drone to that real-world GPS point (only enabled once click-to-fly is active). Press U to climb / D to descend after clicking once.</p>
         </div>
 
         <div class="card">

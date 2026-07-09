@@ -195,6 +195,8 @@ async def get_config():
         "default_laps": config.DEFAULT_LAPS,
         "click_alt_step_m": config.CLICK_ALT_STEP_M,
         "camera_mode": config.CAMERA_MODE,
+        "webcam_index": config.WEBCAM_INDEX,
+        "rtsp_url": config.RTSP_URL,
         "pi_signal_channel": config.PI_SIGNAL_SERVO_CHANNEL,
         "pwm_start_recording": config.PWM_START_RECORDING,
         "pwm_stop_recording": config.PWM_STOP_RECORDING,
@@ -256,6 +258,31 @@ def _mjpeg_generator():
 async def video_feed():
     return StreamingResponse(_mjpeg_generator(),
                              media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+class CameraStartBody(BaseModel):
+    mode: str            # "webcam" | "rtsp"
+    source: str | None = None   # webcam index (as string) or RTSP URL; blank -> config default
+
+
+@app.post("/api/camera/start")
+async def camera_start(body: CameraStartBody):
+    source = body.source
+    if body.mode == "webcam" and source not in (None, ""):
+        try:
+            source = int(source)
+        except ValueError:
+            return {"ok": False, "error": "Webcam source must be a number (device index)."}
+    elif source == "":
+        source = None
+    ctl.start_camera(mode=body.mode, source=source)
+    return {"ok": True}
+
+
+@app.post("/api/camera/stop")
+async def camera_stop():
+    ctl.stop_camera()
+    return {"ok": True}
 
 
 @app.get("/api/camera/status")

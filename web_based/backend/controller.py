@@ -194,9 +194,24 @@ class MissionController:
                "--out=udp:127.0.0.1:14552",   # this app's control connection
                "--out=udp:127.0.0.1:14553"]   # dedicated read-only Pi status listener
         self._log(f"[MAVProxy] {' '.join(cmd)}", "info")
+
+        # MAVProxy's interactive "MAV>" prompt (prompt_toolkit) needs a REAL
+        # Windows console screen buffer. If we pipe stdout to capture it in
+        # our log, Windows gives it no console at all and it crashes with
+        # NoConsoleScreenBufferError. So on Windows we give it its own real
+        # console window instead of piping — we lose in-app log capture for
+        # MAVProxy specifically, but it's how the tool is actually designed
+        # to run. Other platforms don't have this issue, so keep piping there.
         try:
-            self.mav_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                             stderr=subprocess.STDOUT, text=True, bufsize=1)
+            if sys.platform == "win32":
+                self.mav_proc = subprocess.Popen(
+                    cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                self._log("[MAVProxy] Launched in its own console window — "
+                          "check that window directly for link status.", "info")
+            else:
+                self.mav_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+                threading.Thread(target=self._mav_stream, daemon=True).start()
         except Exception as e:
             self._log(f"[MAVProxy] Failed: {e}", "error")
             return
@@ -204,7 +219,17 @@ class MissionController:
             self.state["mav_running"] = True
             self.state["mav_port"] = port
         self._push_state()
-        threading.Thread(target=self._mav_stream, daemon=True).start()
+        if sys.platform == "win32":
+            threading.Thread(target=self._mav_watch_exit, daemon=True).start()
+
+    def _mav_watch_exit(self):
+        """Windows path: no piped stdout to read, so just watch for the
+        process exiting and update state accordingly."""
+        self.mav_proc.wait()
+        self._log("[MAVProxy] Console window closed.", "warn")
+        with self.lock:
+            self.state["mav_running"] = False
+        self._push_state()
 
     def _mav_stream(self):
         for line in self.mav_proc.stdout:
@@ -335,8 +360,12 @@ class MissionController:
                 except Exception as e:
                     self._log(f"[ABORT] RTL error: {e}", "error")
                 finally:
+                    try:
+                        conn.close()
+                    except Exception as e:
+                        self._log(f"[ABORT] Error closing connection: {e}", "warn")
                     self.conn = None
-                    self._stop_camera()
+                    self.stop_camera()
                     self.stop_status_listener()
                     with self.lock:
                         self.state["mission_running"] = False
@@ -345,11 +374,14 @@ class MissionController:
             threading.Thread(target=_do_rtl, daemon=True).start()
         self._set_status("Aborted — RTL", "warn")
 
-    # ── camera ───────────────────────────────────────────────────
-    def _start_camera(self):
+    # ── camera (independent of mission state — bench-testable anytime) ──
+    def start_camera(self, mode: str = None, source=None):
+        if self.cam_active:
+            self._log("[VISION] Camera already running — stop it first to change source.", "warn")
+            return
         try:
             from vision import CameraWorker
-            self.camera = CameraWorker()
+            self.camera = CameraWorker(mode=mode, source=source)
             self.camera.start()
         except Exception as e:
             self._log(f"[VISION] Camera failed to start: {e}", "error")
@@ -359,11 +391,17 @@ class MissionController:
         with self.lock:
             self.state["cam_active"] = True
         self._push_state()
-        info = ("RTSP feed + AI detection running." if config.CAMERA_MODE == "rtsp"
-                else "Webcam feed (CAMERA_MODE='webcam', no AI).")
+        effective_mode = self.camera.mode
+        ai_active = effective_mode == "rtsp" and self.camera._model is not None
+        if effective_mode == "rtsp":
+            info = (f"RTSP feed + AI detection running ({self.camera.source})." if ai_active
+                    else f"RTSP feed only, no AI model loaded ({self.camera.source}).")
+        else:
+            info = f"Webcam feed, no AI (source={self.camera.source})."
+        self._log(f"[VISION] {info}", "ok")
         self._emit({"type": "camera_info", "text": info})
 
-    def _stop_camera(self):
+    def stop_camera(self):
         self.cam_active = False
         self.click_to_fly_enabled = False
         with self.lock:
@@ -373,6 +411,7 @@ class MissionController:
         if self.camera:
             self.camera.stop()
         self.camera = None
+        self._log("[VISION] Camera stopped.", "info")
 
     def get_camera_frame(self):
         if not self.cam_active or self.camera is None:
@@ -494,7 +533,7 @@ class MissionController:
                 self._log(f"[SEARCH] {len(path)}-point straight-line pass generated.", "info")
 
                 self._log("[SEARCH] Starting camera feed...", "info")
-                threading.Thread(target=self._start_camera, daemon=True).start()
+                threading.Thread(target=self.start_camera, daemon=True).start()
 
                 self._log("[MAIN] ── Search / mapping ──", "info")
                 for i, (lat, lon, alt) in enumerate(path, 1):
@@ -528,8 +567,13 @@ class MissionController:
             with self.lock:
                 self.state["awaiting_continue"] = False
             if not manual_handoff:
+                if self.conn is not None:
+                    try:
+                        self.conn.close()
+                    except Exception as e:
+                        self._log(f"[MAIN] Error closing connection: {e}", "warn")
                 self.conn = None
-                self._stop_camera()
+                self.stop_camera()
                 self.stop_status_listener()
                 with self.lock:
                     self.state["mission_running"] = False

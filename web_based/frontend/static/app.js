@@ -11,7 +11,8 @@ let state = {
   awaiting_continue: false, awaiting_post_lap: false, search_available: false,
   click_to_fly_enabled: false, status_text: "Ready", status_level: "info", armed: false,
 };
-let serverConfig = { mission_alt: 5, home_lat: null, home_lon: null, default_laps: 1 };
+let serverConfig = { mission_alt: 5, home_lat: null, home_lon: null, default_laps: 1,
+                     webcam_index: 0, rtsp_url: "" };
 
 async function loadServerConfig() {
   try {
@@ -27,6 +28,7 @@ async function loadServerConfig() {
       `Servo ch${serverConfig.pi_signal_channel}: ` +
       `Record=${serverConfig.pwm_start_recording}us · Stop=${serverConfig.pwm_stop_recording}us · ` +
       `Process=${serverConfig.pwm_start_processing}us`;
+    setCamModeUi(camMode);
   } catch (e) { appendLog("[CONFIG] Could not load /api/config — using defaults.", "warn"); }
 }
 function defaultAlt() { return serverConfig.mission_alt ?? 5; }
@@ -46,6 +48,9 @@ const btnSim = $("btnSim"), btnReal = $("btnReal");
 const btnAbort = $("btnAbort"), btnStart = $("btnStart"), btnContinue = $("btnContinue");
 const statusLbl = $("statusLbl");
 const camImg = $("camImg"), camPlaceholder = $("camPlaceholder"), camInfo = $("camInfo");
+const btnCamWebcam = $("btnCamWebcam"), btnCamRtsp = $("btnCamRtsp"), camSourceInput = $("camSourceInput"),
+      btnCamStart = $("btnCamStart"), btnCamStop = $("btnCamStop");
+let camMode = "webcam";
 const btnPiRecordStart = $("btnPiRecordStart"), btnPiRecordStop = $("btnPiRecordStop"),
       btnPiProcessStart = $("btnPiProcessStart");
 const piLinkDot = $("piLinkDot"), piLastMsg = $("piLastMsg"), piSignalInfo = $("piSignalInfo");
@@ -125,14 +130,18 @@ function applyState(s) {
 
   if (state.awaiting_post_lap) showPostLapModal(state.search_available);
 
-  if (state.mission_running && camImg.getAttribute("src") !== "/video_feed") {
+  if (state.cam_active && camImg.getAttribute("src") !== "/video_feed") {
     camImg.src = "/video_feed";
     camPlaceholder.style.display = "none";
   }
-  if (!state.mission_running && !state.armed) {
+  if (!state.cam_active) {
     camImg.removeAttribute("src");
     camPlaceholder.style.display = "block";
   }
+  btnCamStart.disabled = !!state.cam_active;
+  btnCamStop.disabled = !state.cam_active;
+  [btnCamWebcam, btnCamRtsp].forEach((b) => (b.disabled = !!state.cam_active));
+  camSourceInput.disabled = !!state.cam_active;
 }
 
 // Initial resync (covers the case where the page loads mid-mission)
@@ -404,6 +413,23 @@ btnPiRecordStart.addEventListener("click", () => postJson("/api/pi/recording/sta
 btnPiRecordStop.addEventListener("click", () => postJson("/api/pi/recording/stop", {}));
 btnPiProcessStart.addEventListener("click", () => postJson("/api/pi/processing/start", {}));
 
+function setCamModeUi(mode) {
+  camMode = mode;
+  btnCamWebcam.classList.toggle("active", mode === "webcam");
+  btnCamRtsp.classList.toggle("active", mode === "rtsp");
+  camSourceInput.placeholder = mode === "webcam"
+    ? String(serverConfig.webcam_index ?? 0)
+    : (serverConfig.rtsp_url || "rtsp://192.168.144.25:8554/main.264");
+}
+btnCamWebcam.addEventListener("click", () => setCamModeUi("webcam"));
+btnCamRtsp.addEventListener("click", () => setCamModeUi("rtsp"));
+
+btnCamStart.addEventListener("click", () => {
+  const source = camSourceInput.value.trim();   // blank -> backend falls back to config default
+  postJson("/api/camera/start", { mode: camMode, source: source || null });
+});
+btnCamStop.addEventListener("click", () => postJson("/api/camera/stop", {}));
+
 // ══════════════════════════════════════════════════════════════
 //  Helpers
 // ══════════════════════════════════════════════════════════════
@@ -421,4 +447,5 @@ setModeUi(true);
 connectWs();
 loadServerConfig();
 initialSync();
+camInfo.textContent = "Camera feed inactive. Pick a source and click Start Camera.";
 appendLog("Web UI ready — select mode, load JSON, click Start Mission.", "info");

@@ -1,13 +1,18 @@
 """MAVLink connection helpers.
 
 Connection flow (real drone):
-  1. start_mavproxy.bat  →  opens COM6, forwards to UDP:14550 and UDP:14551
-  2. Mission Planner     →  connects to UDP:127.0.0.1:14550  (read/monitor)
-  3. This script         →  connects to UDP:0.0.0.0:14551    (control)
+  1. start_mavproxy.bat (or start_mavproxy_com3.bat) → opens COM3, forwards to:
+       udp:127.0.0.1:14550  → Mission Planner (read/monitor)
+       udp:127.0.0.1:14552  → this script's control connection
+       udp:127.0.0.1:14553  → dedicated read-only Pi STATUSTEXT listener
+  2. Mission Planner  → connects to udp:127.0.0.1:14550
+  3. This script      → connects to udp:0.0.0.0:14552
 
 SITL flow:
   1. Mission Planner SITL running
   2. This script connects to tcp:127.0.0.1:5762
+     (SITL's 3rd spare port, tcp:127.0.0.1:5763, serves the same role as
+     14553 above for the Pi status listener — see config.default_status_uri())
 """
 import time
 from pymavlink import mavutil
