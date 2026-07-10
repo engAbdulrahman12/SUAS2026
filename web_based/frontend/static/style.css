@@ -189,6 +189,10 @@ select:disabled, input:disabled { color: var(--muted-2); border-color: var(--hai
   flex: none; height: 170px; margin-top: 10px; background: var(--console-bg);
   border: 1px solid var(--hairline); border-radius: 8px; padding: 10px 12px;
 }
+.progress-track { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; margin: 6px 0; }
+.progress-fill { height: 100%; width: 0%; background: var(--acc-cyan); transition: width .25s ease; }
+.progress-fill.done { background: var(--acc-green); }
+.progress-fill.failed { background: var(--acc-red); }
 .log-ok    { color: var(--acc-green); }
 .log-error { color: var(--acc-red); }
 .log-info  { color: var(--acc-cyan); }

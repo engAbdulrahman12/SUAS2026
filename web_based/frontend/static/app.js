@@ -10,6 +10,7 @@ let state = {
   sim: true, mav_running: false, mission_running: false,
   awaiting_continue: false, awaiting_post_lap: false, search_available: false,
   click_to_fly_enabled: false, status_text: "Ready", status_level: "info", armed: false,
+  conn_active: false,
 };
 let serverConfig = { mission_alt: 5, home_lat: null, home_lon: null, default_laps: 1,
                      webcam_index: 0, rtsp_url: "" };
@@ -24,10 +25,7 @@ async function loadServerConfig() {
       ? `${serverConfig.home_lat.toFixed(5)}, ${serverConfig.home_lon.toFixed(5)}`
       : "auto GPS";
     $("homeInfo").textContent = `Alt ${serverConfig.mission_alt} m AGL  ·  Home: ${home}`;
-    piSignalInfo.textContent =
-      `Servo ch${serverConfig.pi_signal_channel}: ` +
-      `Record=${serverConfig.pwm_start_recording}us · Stop=${serverConfig.pwm_stop_recording}us · ` +
-      `Process=${serverConfig.pwm_start_processing}us`;
+    piSignalInfo.textContent = "Sent as text commands over MAVLink STATUSTEXT (no servo output involved).";
     setCamModeUi(camMode);
   } catch (e) { appendLog("[CONFIG] Could not load /api/config — using defaults.", "warn"); }
 }
@@ -50,11 +48,14 @@ const statusLbl = $("statusLbl");
 const camImg = $("camImg"), camPlaceholder = $("camPlaceholder"), camInfo = $("camInfo");
 const btnCamWebcam = $("btnCamWebcam"), btnCamRtsp = $("btnCamRtsp"), camSourceInput = $("camSourceInput"),
       btnCamStart = $("btnCamStart"), btnCamStop = $("btnCamStop");
+const btnConnect = $("btnConnect"), btnDisconnect = $("btnDisconnect"), connDot2 = $("connDot2");
 let camMode = "webcam";
 const btnPiRecordStart = $("btnPiRecordStart"), btnPiRecordStop = $("btnPiRecordStop"),
-      btnPiProcessStart = $("btnPiProcessStart");
+      btnPiProcessStart = $("btnPiProcessStart"), btnPiSendMap = $("btnPiSendMap");
 const piLinkDot = $("piLinkDot"), piLastMsg = $("piLastMsg"), piSignalInfo = $("piSignalInfo");
 const piLogBox = $("piLogBox");
+const mapTransferCard = $("mapTransferCard"), mapProgressFill = $("mapProgressFill"),
+      mapTransferInfo = $("mapTransferInfo"), mapReceivedImg = $("mapReceivedImg");
 
 // ══════════════════════════════════════════════════════════════
 //  WebSocket — log / status / state push channel
@@ -73,6 +74,7 @@ function connectWs() {
     else if (msg.type === "state") applyState(msg.state);
     else if (msg.type === "camera_info") camInfo.textContent = msg.text;
     else if (msg.type === "pi_status") showPiMessage(msg.text, msg.level, msg.ts);
+    else if (msg.type === "map_transfer") handleMapTransfer(msg);
   };
 }
 
@@ -104,6 +106,29 @@ function showPiMessage(text, level, ts) {
   while (piLogBox.children.length > 500) piLogBox.removeChild(piLogBox.firstChild);
 }
 
+function handleMapTransfer(msg) {
+  mapTransferCard.style.display = "block";
+  mapProgressFill.classList.remove("done", "failed");
+
+  if (msg.phase === "start") {
+    mapProgressFill.style.width = "0%";
+    mapTransferInfo.textContent = `Receiving map: ${msg.packets} packets incoming...`;
+    mapReceivedImg.style.display = "none";
+  } else if (msg.phase === "progress") {
+    mapProgressFill.style.width = `${msg.pct}%`;
+    mapTransferInfo.textContent = `Receiving map: ${msg.pct}% (${msg.received}/${msg.packets} packets)`;
+  } else if (msg.phase === "done") {
+    mapProgressFill.style.width = "100%";
+    mapProgressFill.classList.add("done");
+    mapTransferInfo.textContent = `Map received (${msg.size} bytes, CRC32 verified) ✓`;
+    mapReceivedImg.src = `/received_maps/${msg.filename}?t=${Date.now()}`;
+    mapReceivedImg.style.display = "block";
+  } else if (msg.phase === "failed") {
+    mapProgressFill.classList.add("failed");
+    mapTransferInfo.textContent = `Transfer failed: ${msg.reason || "unknown error"}`;
+  }
+}
+
 function applyState(s) {
   state = { ...state, ...s };
   btnAbort.disabled = !(state.armed || state.mission_running);
@@ -121,8 +146,11 @@ function applyState(s) {
   railCamera.classList.toggle("on", !!state.cam_active);
   railPi.classList.toggle("on", !!state.pi_link_active);
 
-  const piConnected = state.armed || state.mission_running;
-  [btnPiRecordStart, btnPiRecordStop, btnPiProcessStart].forEach((b) => (b.disabled = !piConnected));
+  const piConnected = state.conn_active;
+  [btnPiRecordStart, btnPiRecordStop, btnPiProcessStart, btnPiSendMap].forEach((b) => (b.disabled = !piConnected));
+  btnConnect.disabled = !!state.conn_active;
+  btnDisconnect.disabled = !state.conn_active;
+  connDot2.classList.toggle("on", !!state.conn_active);
   piLinkDot.classList.toggle("on", !!state.pi_link_active);
   if (state.pi_last_message && piLastMsg.textContent === "No Pi messages yet.") {
     piLastMsg.textContent = state.pi_last_message;
@@ -412,6 +440,7 @@ camImg.addEventListener("keydown", (evt) => {
 btnPiRecordStart.addEventListener("click", () => postJson("/api/pi/recording/start", {}));
 btnPiRecordStop.addEventListener("click", () => postJson("/api/pi/recording/stop", {}));
 btnPiProcessStart.addEventListener("click", () => postJson("/api/pi/processing/start", {}));
+btnPiSendMap.addEventListener("click", () => postJson("/api/pi/map/send", {}));
 
 function setCamModeUi(mode) {
   camMode = mode;
@@ -429,6 +458,9 @@ btnCamStart.addEventListener("click", () => {
   postJson("/api/camera/start", { mode: camMode, source: source || null });
 });
 btnCamStop.addEventListener("click", () => postJson("/api/camera/stop", {}));
+
+btnConnect.addEventListener("click", () => postJson("/api/connect", { uri: uriInput.value.trim() }));
+btnDisconnect.addEventListener("click", () => postJson("/api/disconnect", {}));
 
 // ══════════════════════════════════════════════════════════════
 //  Helpers

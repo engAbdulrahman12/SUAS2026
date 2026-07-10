@@ -153,6 +153,17 @@
       <!-- Camera tab -->
       <div class="tab-panel" id="tab-cam">
         <div class="card">
+          <div class="card-title">VEHICLE CONNECTION (independent of missions)</div>
+          <div class="field-row" style="flex-wrap:wrap; gap:10px;">
+            <span id="connDot2" class="rail-dot standalone"></span>
+            <button id="btnConnect" class="btn btn-success">Connect</button>
+            <button id="btnDisconnect" class="btn btn-danger" disabled>Disconnect</button>
+            <span class="muted small">Uses the Mode/URI set in the toolbar above.</span>
+          </div>
+          <p class="muted small">Connect here to use click-to-fly and the Pi controls below anytime — no need to run a full waypoint mission first. Use Abort instead of Disconnect while an actual mission is flying.</p>
+        </div>
+
+        <div class="card">
           <div class="card-title">CAMERA SOURCE</div>
           <div class="field-row" style="flex-wrap:wrap; gap:10px;">
             <div class="btn-group">
@@ -177,6 +188,7 @@
             <button id="btnPiRecordStart" class="btn btn-success" disabled>● Start Recording</button>
             <button id="btnPiRecordStop" class="btn btn-danger" disabled>■ Stop Recording</button>
             <button id="btnPiProcessStart" class="btn btn-primary" disabled>▶ Start Processing</button>
+            <button id="btnPiSendMap" class="btn btn-warn" disabled>🗺 Send Map</button>
           </div>
           <p class="muted small mono" id="piSignalInfo"></p>
           <div class="field-row">
@@ -184,6 +196,15 @@
             <span id="piLastMsg" class="muted small">No Pi messages yet.</span>
           </div>
           <div id="piLogBox" class="log-box pi-log-box mono"></div>
+        </div>
+
+        <div class="card" id="mapTransferCard" style="display:none;">
+          <div class="card-title">MAP TRANSFER</div>
+          <div class="progress-track">
+            <div id="mapProgressFill" class="progress-fill"></div>
+          </div>
+          <p class="muted small" id="mapTransferInfo">Waiting...</p>
+          <img id="mapReceivedImg" style="display:none; max-width:100%; border-radius:8px; margin-top:8px;">
         </div>
 
         <div class="cam-holder">

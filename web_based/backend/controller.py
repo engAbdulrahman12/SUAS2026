@@ -17,7 +17,16 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+# Custom dialect MUST be set before any mavlink_connection() is created —
+# see image_transfer_dialect/SETUP.md for the one-time generation/install
+# step this depends on (both this machine and the Pi need it).
+from pymavlink import mavutil
+
+from image_transfer import ImageReceiver, ImageTransferConfig, IMGACK_PREFIX, IMGFAIL_PREFIX
+
 import config
+
+RECEIVED_MAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "received_maps")
 
 
 def _guess_level(text: str) -> str:
@@ -89,6 +98,20 @@ class MissionController:
         self.status_listener_thread = None
         self.status_listener_running = False
 
+        # Image receiver (standard MAVLink messages only — STATUSTEXT +
+        # DATA_TRANSMISSION_HANDSHAKE + ENCAPSULATED_DATA, no custom dialect) —
+        # wired to emit the same "map_transfer" event shape the frontend
+        # already understands (start/progress/done/failed), so no frontend
+        # changes were needed for this swap.
+        self.image_receiver = ImageReceiver(
+            config=ImageTransferConfig(output_dir=RECEIVED_MAPS_DIR, timeout_s=30.0),
+            on_progress=self._on_image_progress,
+            on_complete=self._on_image_complete,
+            on_log=lambda text: self._log(text, "info"),
+            on_resend_request=self._on_image_resend_request,
+            on_ack=self._on_image_ack,
+        )
+
         # mission flow control (mirrors the old GUI's Continue/Abort buttons)
         self.continue_ev = threading.Event()
         self.post_lap_choice = None
@@ -107,6 +130,7 @@ class MissionController:
             "status_text": "Ready",
             "status_level": "info",
             "armed": False,
+            "conn_active": False,
             "cam_active": False,
             "pi_link_active": False,
             "pi_last_message": None,
@@ -254,15 +278,16 @@ class MissionController:
             self.state["mav_running"] = False
         self._push_state()
 
-    # ── Pi signalling (servo output) ────────────────────────────
-    def send_servo_command(self, pwm: int, label: str):
+    # ── Pi signalling (text commands over STATUSTEXT) ───────────
+    def send_text_command(self, command: str, label: str):
         if self.conn is None:
             self._log(f"[PI-CMD] Not connected — cannot send {label}.", "error")
             return
-        from flight import set_servo
+        from pymavlink import mavutil
+        payload = command.encode("utf-8")[:50]
         try:
-            set_servo(self.conn, config.PI_SIGNAL_SERVO_CHANNEL, pwm)
-            self._log(f"[PI-CMD] {label} → servo ch{config.PI_SIGNAL_SERVO_CHANNEL} = {pwm} us", "info")
+            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, payload)
+            self._log(f"[PI-CMD] {label} → sent '{command}'", "info")
         except Exception as e:
             self._log(f"[PI-CMD] {label} failed: {e}", "error")
 
@@ -289,26 +314,129 @@ class MissionController:
             self._log(f"[PI-LINK] Listening for Pi status on {target_uri}", "ok")
             while self.status_listener_running:
                 try:
-                    msg = self.status_conn.recv_match(type="STATUSTEXT", blocking=True, timeout=2)
+                    msg = self.status_conn.recv_match(
+                        type=["STATUSTEXT", "DATA_TRANSMISSION_HANDSHAKE", "ENCAPSULATED_DATA"],
+                        blocking=True, timeout=2)
                 except Exception:
                     break
+
+                # Let the image receiver notice a stalled transfer on its own
+                # schedule (it has no other way to detect this between messages).
+                try:
+                    self.image_receiver.check_timeout()
+                except Exception as e:
+                    print(f"[PI-LINK] check_timeout error: {e}", file=sys.__stdout__)
+
                 if msg is None:
                     continue
-                text = (msg.text or "").rstrip("\x00")
-                level = self._SEVERITY_TO_LEVEL.get(getattr(msg, "severity", 6), "info")
-                entry = {"type": "pi_status", "text": text, "level": level, "ts": time.time()}
-                with self.lock:
-                    self.pi_log_history.append(entry)
-                    self.pi_log_history = self.pi_log_history[-500:]
-                    self.state["pi_last_message"] = text
-                self._emit(entry)
-                print(f"[PI] {text}", file=sys.__stdout__)   # bypasses the tee — console only, not the mission log
+
+                # Dispatch is wrapped so ONE bad/unexpected message can never
+                # silently kill this whole background thread — without this,
+                # any exception here (bad field, decode error, whatever) would
+                # break out of the loop permanently with no visible error.
+                try:
+                    mtype = msg.get_type()
+                    if mtype == "STATUSTEXT":
+                        # IMGMETA-prefixed lines are our own image-transfer metadata,
+                        # not a genuine Pi status message -- let the receiver consume
+                        # those, and only log the rest as normal Pi status text.
+                        if not self.image_receiver.handle_message(msg):
+                            self._handle_pi_statustext(msg)
+                    elif mtype in ("DATA_TRANSMISSION_HANDSHAKE", "ENCAPSULATED_DATA"):
+                        self.image_receiver.handle_message(msg)
+                except Exception as e:
+                    print(f"[PI-LINK] Error handling {msg.get_type()}: {e}", file=sys.__stdout__)
+                    import traceback
+                    traceback.print_exc(file=sys.__stdout__)
+
             with self.lock:
                 self.state["pi_link_active"] = False
             self._push_state()
 
         self.status_listener_thread = threading.Thread(target=_run, daemon=True)
         self.status_listener_thread.start()
+
+    def _handle_pi_statustext(self, msg):
+        text = (msg.text or "").rstrip("\x00")
+        if text.startswith("CMD:"):
+            return   # this is our own outgoing command echoed back by the link, not a Pi message
+        level = self._SEVERITY_TO_LEVEL.get(getattr(msg, "severity", 6), "info")
+        entry = {"type": "pi_status", "text": text, "level": level, "ts": time.time()}
+        with self.lock:
+            self.pi_log_history.append(entry)
+            self.pi_log_history = self.pi_log_history[-500:]
+            self.state["pi_last_message"] = text
+        self._emit(entry)
+        print(f"[PI] {text}", file=sys.__stdout__)   # bypasses the tee — console only
+
+    # ── Map image reception (standard MAVLink messages, no custom dialect) ──
+    # Actual reassembly/CRC verification lives in image_transfer.ImageReceiver
+    # (self.image_receiver, wired up in __init__) — these two methods just
+    # adapt its callbacks to the "map_transfer" websocket event shape the
+    # frontend already understands, so no frontend changes were needed.
+    def _on_image_progress(self, received, total, pct):
+        if received == 0:
+            self._emit({"type": "map_transfer", "phase": "start",
+                       "packets": total, "size": None})
+        else:
+            self._emit({"type": "map_transfer", "phase": "progress",
+                       "received": received, "packets": total, "pct": pct})
+
+    def _on_image_complete(self, path, ok, reason):
+        if ok:
+            filename = os.path.basename(path)
+            size = os.path.getsize(path)
+            self._log(f"[IMG] Map received and saved → {filename} ({size} bytes)", "ok")
+            self._emit({"type": "map_transfer", "phase": "done", "filename": filename, "size": size})
+        else:
+            self._log(f"[IMG] Map transfer failed: {reason}", "error")
+            self._emit({"type": "map_transfer", "phase": "failed", "reason": reason})
+
+    def _on_image_ack(self, image_id: int, ok: bool):
+        """Sends the confirmation the sender is actually waiting for
+        before it considers the transfer done. Sent multiple times if the
+        sender keeps nudging with IMGDONE (meaning our first ack likely
+        got lost on the way) -- idempotent on the sender's side either way."""
+        if self.conn is None:
+            return
+        prefix = IMGACK_PREFIX if ok else IMGFAIL_PREFIX
+        text = f"{prefix}{image_id:08x}"
+        try:
+            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode("utf-8")[:50])
+        except Exception as e:
+            self._log(f"[IMG] Failed to send {'ack' if ok else 'fail'} confirmation: {e}", "error")
+
+    def _on_image_resend_request(self, image_id: int, missing_seqs: list):
+        """Sends an IMGRESEND STATUSTEXT back to the Pi over the normal
+        read/write connection (the status listener is read-only, so this
+        can't go out over that one). A STATUSTEXT is capped at 50 bytes,
+        so a long list of missing packet numbers gets split across
+        multiple messages rather than silently truncated/corrupted."""
+        if self.conn is None:
+            self._log("[IMG] Cannot request resend — not connected.", "warn")
+            return
+        prefix = f"IMGRESEND:{image_id:08x}:"
+        budget = 50 - len(prefix.encode("utf-8"))
+        parts = [str(s) for s in missing_seqs]
+
+        batch, batch_len = [], 0
+        for part in parts:
+            add_len = len(part) + (1 if batch else 0)
+            if batch_len + add_len > budget and batch:
+                self._send_resend_batch(prefix, batch)
+                batch, batch_len = [], 0
+                add_len = len(part)
+            batch.append(part)
+            batch_len += add_len
+        if batch:
+            self._send_resend_batch(prefix, batch)
+
+    def _send_resend_batch(self, prefix: str, batch: list):
+        text = prefix + ",".join(batch)
+        try:
+            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode("utf-8")[:50])
+        except Exception as e:
+            self._log(f"[IMG] Failed to send resend request: {e}", "error")
 
     def stop_status_listener(self):
         self.status_listener_running = False
@@ -365,14 +493,66 @@ class MissionController:
                     except Exception as e:
                         self._log(f"[ABORT] Error closing connection: {e}", "warn")
                     self.conn = None
-                    self.stop_camera()
                     self.stop_status_listener()
                     with self.lock:
                         self.state["mission_running"] = False
+                        self.state["conn_active"] = False
                         self.state["armed"] = False
                     self._push_state()
             threading.Thread(target=_do_rtl, daemon=True).start()
         self._set_status("Aborted — RTL", "warn")
+
+    # ── standalone connect (independent of running a full mission) ──
+    def connect_standalone(self, uri: str):
+        """Connects to the vehicle without going through the waypoint/
+        arm/takeoff mission flow — just enough to use click-to-fly and
+        the Pi Recording/Processing/Send Map controls on the bench."""
+        if self.conn is not None:
+            self._log("[CONN] Already connected.", "warn")
+            return
+
+        def _run():
+            from connection import connect as _connect
+            self._log(f"[CONN] Connecting → {uri}", "info")
+            self._set_status("Connecting…", "info")
+            try:
+                conn = _connect(uri=uri)
+            except Exception as e:
+                self._log(f"[CONN] Connect failed: {e}", "error")
+                self._set_status("Connect failed", "error")
+                return
+            self.conn = conn
+            self.start_status_listener()
+            self.click_to_fly_enabled = True
+            with self.lock:
+                self.state["conn_active"] = True
+                self.state["click_to_fly_enabled"] = True
+            self._push_state()
+            self._log("[CONN] Connected ✓ (standalone — no mission required)", "ok")
+            self._set_status("Connected (standalone)", "ok")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def disconnect_standalone(self):
+        if self.conn is None:
+            self._log("[CONN] Not connected.", "warn")
+            return
+        if self.mission_thread is not None and self.mission_thread.is_alive():
+            self._log("[CONN] A mission is running — use Abort instead of Disconnect.", "warn")
+            return
+        try:
+            self.conn.close()
+        except Exception as e:
+            self._log(f"[CONN] Error closing connection: {e}", "warn")
+        self.conn = None
+        self.click_to_fly_enabled = False
+        self.stop_status_listener()
+        with self.lock:
+            self.state["conn_active"] = False
+            self.state["click_to_fly_enabled"] = False
+        self._push_state()
+        self._log("[CONN] Disconnected.", "info")
+        self._set_status("Ready", "info")
 
     # ── camera (independent of mission state — bench-testable anytime) ──
     def start_camera(self, mode: str = None, source=None):
@@ -481,6 +661,9 @@ class MissionController:
             conn = connect(uri=params.uri)
             self.conn = conn
             self.start_status_listener()
+            with self.lock:
+                self.state["conn_active"] = True
+            self._push_state()
             take_lat, take_lon = wait_gps(conn, simulation=bool(cfg.TEST_FLAG))
             msg = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
             alt_msl = (msg.alt / 1000.0) if msg else 0.0
@@ -573,9 +756,9 @@ class MissionController:
                     except Exception as e:
                         self._log(f"[MAIN] Error closing connection: {e}", "warn")
                 self.conn = None
-                self.stop_camera()
                 self.stop_status_listener()
                 with self.lock:
                     self.state["mission_running"] = False
                     self.state["armed"] = False
+                    self.state["conn_active"] = False
             self._push_state()

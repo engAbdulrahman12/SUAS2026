@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import config
-from controller import MissionController, MissionParams
+from controller import MissionController, MissionParams, RECEIVED_MAPS_DIR
 
 app = FastAPI(title="SUAS 2026 Mission Backend")
 
@@ -68,6 +68,9 @@ async def _startup():
 
 # ── Static frontend ──────────────────────────────────────────────
 app.mount("/static", StaticFiles(directory=os.path.join(FRONTEND_DIR, "static")), name="static")
+
+os.makedirs(RECEIVED_MAPS_DIR, exist_ok=True)
+app.mount("/received_maps", StaticFiles(directory=RECEIVED_MAPS_DIR), name="received_maps")
 
 
 @app.get("/")
@@ -140,6 +143,22 @@ class SearchCorner(BaseModel):
     alt: float
 
 
+class ConnectBody(BaseModel):
+    uri: str
+
+
+@app.post("/api/connect")
+async def connect_standalone(body: ConnectBody):
+    ctl.connect_standalone(body.uri)
+    return {"ok": True}
+
+
+@app.post("/api/disconnect")
+async def disconnect_standalone():
+    ctl.disconnect_standalone()
+    return {"ok": True}
+
+
 class MissionStartBody(BaseModel):
     waypoints: list[Waypoint]
     laps: int
@@ -197,10 +216,10 @@ async def get_config():
         "camera_mode": config.CAMERA_MODE,
         "webcam_index": config.WEBCAM_INDEX,
         "rtsp_url": config.RTSP_URL,
-        "pi_signal_channel": config.PI_SIGNAL_SERVO_CHANNEL,
-        "pwm_start_recording": config.PWM_START_RECORDING,
-        "pwm_stop_recording": config.PWM_STOP_RECORDING,
-        "pwm_start_processing": config.PWM_START_PROCESSING,
+        "cmd_record_start": config.CMD_RECORD_START,
+        "cmd_record_stop": config.CMD_RECORD_STOP,
+        "cmd_process_start": config.CMD_PROCESS_START,
+        "cmd_send_map": config.CMD_SEND_MAP,
     }
 
 
@@ -294,19 +313,25 @@ async def camera_status():
 # ── REST: Pi companion-computer signalling ───────────────────────
 @app.post("/api/pi/recording/start")
 async def pi_recording_start():
-    ctl.send_servo_command(config.PWM_START_RECORDING, "Start Recording")
+    ctl.send_text_command(config.CMD_RECORD_START, "Start Recording")
     return {"ok": True}
 
 
 @app.post("/api/pi/recording/stop")
 async def pi_recording_stop():
-    ctl.send_servo_command(config.PWM_STOP_RECORDING, "Stop Recording")
+    ctl.send_text_command(config.CMD_RECORD_STOP, "Stop Recording")
     return {"ok": True}
 
 
 @app.post("/api/pi/processing/start")
 async def pi_processing_start():
-    ctl.send_servo_command(config.PWM_START_PROCESSING, "Start Processing")
+    ctl.send_text_command(config.CMD_PROCESS_START, "Start Processing")
+    return {"ok": True}
+
+
+@app.post("/api/pi/map/send")
+async def pi_map_send():
+    ctl.send_text_command(config.CMD_SEND_MAP, "Send Map")
     return {"ok": True}
 
 

@@ -82,15 +82,14 @@ CLICK_ALT_STEP_M = 2.0
 # NOTE: water-bottle / beacon release controls are intentionally NOT
 # implemented yet — that's a later step per the current plan.
 
-# ----- Pi companion-computer signalling (servo output as a command channel) --
-# The Pi reads this AUX/servo channel's PWM value to know which state to
-# enter (recording / processing). CONFIRM this channel number matches your
-# actual AUX wiring before flying — sending the wrong PWM to the wrong
-# channel could move something unintended (e.g. a payload release servo).
-PI_SIGNAL_SERVO_CHANNEL = 9        # AUX1 on Pixhawk (servo output 9) — verify!
-PWM_START_RECORDING     = 900
-PWM_STOP_RECORDING      = 1000
-PWM_START_PROCESSING    = 1100
+# ----- Pi companion-computer signalling (text commands over STATUSTEXT) -----
+# Sent as STATUSTEXT through the normal MAVLink connection -> Pixhawk ->
+# Pi (already connected via USB). MUST match the Pi script's CMD_* constants
+# exactly — if you change one side, change the other.
+CMD_RECORD_START  = "CMD:RECORD_START"
+CMD_RECORD_STOP   = "CMD:RECORD_STOP"
+CMD_PROCESS_START = "CMD:PROCESS_START"
+CMD_SEND_MAP      = "CMD:SEND_MAP"
 
 # ----- Dedicated read-only link for incoming Pi STATUSTEXT messages ---------
 # A SEPARATE connection, used only for listening — never for control — so
