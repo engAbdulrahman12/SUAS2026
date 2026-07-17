@@ -36,7 +36,7 @@ MISSION_ALT  = 5
 # ----- Mission behaviour ---------------------------------------
 DEFAULT_LAPS             = 1
 WP_ACCEPT_RADIUS_M       = 3.0
-MAX_DISTANCE_FROM_HOME_M = 500.0
+MAX_DISTANCE_FROM_HOME_M = 100000
 
 # ----- GPS readiness -------------------------------------------
 MIN_GPS_FIX_TYPE = 0

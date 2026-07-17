@@ -42,13 +42,19 @@ const portSelect = $("portSelect");
 const btnRefreshPorts = $("btnRefreshPorts");
 const btnMav = $("btnMav");
 const mavStatus = $("mavStatus");
-const btnSim = $("btnSim"), btnReal = $("btnReal");
+const btnSim = $("btnSim"), btnReal = $("btnReal"), btnHybrid = $("btnHybrid");
+const piLinkRow = $("piLinkRow"), piLinkHint = $("piLinkHint");
 const btnAbort = $("btnAbort"), btnStart = $("btnStart"), btnContinue = $("btnContinue");
 const statusLbl = $("statusLbl");
 const camImg = $("camImg"), camPlaceholder = $("camPlaceholder"), camInfo = $("camInfo");
 const btnCamWebcam = $("btnCamWebcam"), btnCamRtsp = $("btnCamRtsp"), camSourceInput = $("camSourceInput"),
       btnCamStart = $("btnCamStart"), btnCamStop = $("btnCamStop");
 const btnConnect = $("btnConnect"), btnDisconnect = $("btnDisconnect"), connDot2 = $("connDot2");
+const piLinkUriInput = $("piLinkUriInput"), btnSetPiLinkUri = $("btnSetPiLinkUri");
+const btnClickFly = $("btnClickFly"), btnClickPin = $("btnClickPin");
+const pinsList = $("pinsList"), pinsEmpty = $("pinsEmpty"), routeSuggestion = $("routeSuggestion");
+const btnSuggestRoute = $("btnSuggestRoute"), btnClearPins = $("btnClearPins");
+let pins = [];
 let camMode = "webcam";
 const btnPiRecordStart = $("btnPiRecordStart"), btnPiRecordStop = $("btnPiRecordStop"),
       btnPiProcessStart = $("btnPiProcessStart"), btnPiSendMap = $("btnPiSendMap");
@@ -75,6 +81,7 @@ function connectWs() {
     else if (msg.type === "camera_info") camInfo.textContent = msg.text;
     else if (msg.type === "pi_status") showPiMessage(msg.text, msg.level, msg.ts);
     else if (msg.type === "map_transfer") handleMapTransfer(msg);
+    else if (msg.type === "pins_update") { pins = msg.pins; renderPins(); }
   };
 }
 
@@ -131,6 +138,10 @@ function handleMapTransfer(msg) {
 
 function applyState(s) {
   state = { ...state, ...s };
+  if (state.click_mode) setClickModeUi(state.click_mode);
+  if (state.pi_link_uri !== undefined && document.activeElement !== piLinkUriInput) {
+    piLinkUriInput.value = state.pi_link_uri || "";
+  }
   btnAbort.disabled = !(state.armed || state.mission_running);
   btnStart.disabled = state.mission_running;
   btnContinue.style.display = state.awaiting_continue ? "inline-block" : "none";
@@ -179,6 +190,7 @@ async function initialSync() {
     const data = await r.json();
     for (const entry of data.log) appendLog(entry.text, entry.level);
     for (const entry of data.pi_log) showPiMessage(entry.text, entry.level, entry.ts);
+    if (data.pins) { pins = data.pins; renderPins(); }
     applyState(data.state);
   } catch (e) { /* backend not up yet — WS retry loop will catch it */ }
 }
@@ -198,18 +210,35 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
 // ══════════════════════════════════════════════════════════════
 //  Mode / connection
 // ══════════════════════════════════════════════════════════════
-function setModeUi(sim) {
-  btnSim.classList.toggle("active", sim);
+function setModeUi(sim, hybrid) {
+  hybrid = !!hybrid;
+  btnSim.classList.toggle("active", sim && !hybrid);
   btnReal.classList.toggle("active", !sim);
-  modeBadge.textContent = sim ? "SIMULATION" : "REAL DRONE";
-  modeBadge.classList.toggle("real", !sim);
+  btnHybrid.classList.toggle("active", hybrid);
+  modeBadge.textContent = hybrid ? "HYBRID (SITL + real Pi link)" : (sim ? "SIMULATION" : "REAL DRONE");
+  modeBadge.classList.toggle("real", !sim && !hybrid);
+  modeBadge.classList.toggle("hybrid", hybrid);
   uriInput.value = sim ? "tcp:127.0.0.1:5762" : "udp:0.0.0.0:14552";
   [portSelect, btnRefreshPorts, btnMav].forEach((el) => (el.disabled = sim));
   if (!sim) refreshPorts();
+
+  piLinkRow.classList.toggle("hybrid-active", hybrid);
+  piLinkHint.classList.toggle("hybrid-active", hybrid);
+  if (hybrid) {
+    piLinkHint.textContent = "Hybrid mode: set this to your real bench Pixhawk's connection " +
+      "string (e.g. COM8) so camera/Pi commands go there while flight stays in SITL.";
+    piLinkUriInput.focus();
+  } else {
+    piLinkHint.textContent = "Leave blank for normal operation (one Pixhawk handles both flight " +
+      "and Pi commands). Set this to a separate connection string only when testing with SITL for " +
+      "flight WHILE a real Pixhawk on the bench relays Pi commands — validates the real hardware " +
+      "path without flying.";
+  }
 }
 
-btnSim.addEventListener("click", () => { setModeUi(true); postJson("/api/mode", { sim: true }); });
-btnReal.addEventListener("click", () => { setModeUi(false); postJson("/api/mode", { sim: false }); });
+btnSim.addEventListener("click", () => { setModeUi(true, false); postJson("/api/mode", { sim: true }); });
+btnReal.addEventListener("click", () => { setModeUi(false, false); postJson("/api/mode", { sim: false }); });
+btnHybrid.addEventListener("click", () => { setModeUi(true, true); postJson("/api/mode", { sim: true }); });
 
 document.querySelectorAll(".chip").forEach((chip) => {
   chip.addEventListener("click", () => (uriInput.value = chip.dataset.uri));
@@ -461,6 +490,64 @@ btnCamStop.addEventListener("click", () => postJson("/api/camera/stop", {}));
 
 btnConnect.addEventListener("click", () => postJson("/api/connect", { uri: uriInput.value.trim() }));
 btnDisconnect.addEventListener("click", () => postJson("/api/disconnect", {}));
+
+btnSetPiLinkUri.addEventListener("click", () => {
+  const uri = piLinkUriInput.value.trim();
+  if (uri && !confirm(`Route Pi commands through a SEPARATE connection (${uri}) instead of the vehicle link?`)) return;
+  postJson("/api/pi_link/set_uri", { uri });
+});
+
+btnClickFly.addEventListener("click", () => { setClickModeUi("fly"); postJson("/api/camera/click_mode", { mode: "fly" }); });
+btnClickPin.addEventListener("click", () => { setClickModeUi("pin"); postJson("/api/camera/click_mode", { mode: "pin" }); });
+function setClickModeUi(mode) {
+  btnClickFly.classList.toggle("active", mode === "fly");
+  btnClickPin.classList.toggle("active", mode === "pin");
+}
+
+function renderPins() {
+  pinsEmpty.style.display = pins.length ? "none" : "block";
+  pinsList.innerHTML = "";
+  for (const p of pins) {
+    const row = document.createElement("div");
+    row.className = "pin-row";
+    const dist = p.distance_m != null ? `${p.distance_m.toFixed(0)} m` : "—";
+    row.innerHTML = `
+      <span class="pin-name">${p.name}</span>
+      <span class="pin-coords">${p.lat.toFixed(7)}, ${p.lon.toFixed(7)}</span>
+      <span class="pin-dist">${dist}</span>
+      <button class="btn btn-mini fly-pin-btn">Fly here</button>`;
+    row.querySelector(".fly-pin-btn").addEventListener("click", () => {
+      if (!confirm(`Fly to ${p.name}?`)) return;
+      postJson("/api/pins/fly", { pin_id: p.id });
+    });
+    pinsList.appendChild(row);
+  }
+}
+
+btnClearPins.addEventListener("click", () => {
+  if (!confirm("Clear all pinned objects?")) return;
+  postJson("/api/pins/clear", {});
+});
+
+btnSuggestRoute.addEventListener("click", async () => {
+  try {
+    const r = await fetch("/api/pins/suggest_route");
+    const data = await r.json();
+    if (!data.names || !data.names.length) {
+      routeSuggestion.style.display = "block";
+      routeSuggestion.textContent = "No pins to route yet.";
+      return;
+    }
+    routeSuggestion.style.display = "block";
+    routeSuggestion.innerHTML =
+      `Suggested order: <b>${data.names.join(" → ")}</b> — total ${data.total_distance_m.toFixed(0)} m. ` +
+      `<button class="btn btn-mini btn-success" id="btnFlySuggested">Fly this route</button>`;
+    document.getElementById("btnFlySuggested").addEventListener("click", () => {
+      if (!confirm(`Fly route: ${data.names.join(" → ")}?`)) return;
+      postJson("/api/pins/fly_route", { order: data.order });
+    });
+  } catch (e) { appendLog("[ROUTE] Could not fetch suggestion.", "error"); }
+});
 
 // ══════════════════════════════════════════════════════════════
 //  Helpers

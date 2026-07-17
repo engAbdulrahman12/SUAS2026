@@ -159,6 +159,16 @@ async def disconnect_standalone():
     return {"ok": True}
 
 
+class PiLinkUriBody(BaseModel):
+    uri: str   # empty string -> revert to normal (Pi commands via the vehicle connection)
+
+
+@app.post("/api/pi_link/set_uri")
+async def set_pi_link_uri(body: PiLinkUriBody):
+    ctl.set_pi_link_uri(body.uri)
+    return {"ok": True}
+
+
 class MissionStartBody(BaseModel):
     waypoints: list[Waypoint]
     laps: int
@@ -200,7 +210,8 @@ async def mission_abort():
 
 @app.get("/api/state")
 async def get_state():
-    return {"state": dict(ctl.state), "log": ctl.log_history[-200:], "pi_log": ctl.pi_log_history[-200:]}
+    return {"state": dict(ctl.state), "log": ctl.log_history[-200:], "pi_log": ctl.pi_log_history[-200:],
+           "pins": ctl.pins}
 
 
 @app.get("/api/config")
@@ -237,8 +248,55 @@ async def camera_click(body: ClickBody):
     return {"ok": True}
 
 
+class ClickModeBody(BaseModel):
+    mode: str   # "fly" | "pin"
+
+
+@app.post("/api/camera/click_mode")
+async def camera_click_mode(body: ClickModeBody):
+    ctl.set_click_mode(body.mode)
+    return {"ok": True}
+
+
+@app.get("/api/pins")
+async def get_pins():
+    return {"pins": ctl.pins}
+
+
+@app.post("/api/pins/clear")
+async def clear_pins():
+    ctl.clear_pins()
+    return {"ok": True}
+
+
+@app.get("/api/pins/suggest_route")
+async def suggest_route():
+    return ctl.suggest_route()
+
+
+class FlyPinBody(BaseModel):
+    pin_id: int
+
+
+@app.post("/api/pins/fly")
+async def fly_to_pin(body: FlyPinBody):
+    ctl.fly_to_pin(body.pin_id)
+    return {"ok": True}
+
+
+class FlyRouteBody(BaseModel):
+    order: list[int]
+
+
+@app.post("/api/pins/fly_route")
+async def fly_route(body: FlyRouteBody):
+    ctl.fly_route(body.order)
+    return {"ok": True}
+
+
 class AltBody(BaseModel):
     direction: str   # "u" | "d"
+
 
 
 @app.post("/api/camera/alt")

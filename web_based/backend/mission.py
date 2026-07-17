@@ -42,7 +42,8 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                 waypoints: list[tuple[float, float, float]],
                 laps: int,
                 home_lat: float = None,
-                home_lon: float = None) -> list[dict]:
+                home_lon: float = None,
+                search_corners: list[tuple[float, float, float]] = None) -> list[dict]:
     """Build the ordered list of mission item dicts.
 
     home_lat / home_lon: RTL return point.  Pass the drone's actual GPS
@@ -50,6 +51,15 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                          back to takeoff position — so RTL goes back to
                          where the drone launched, wherever that is.
     waypoints: list of (lat, lon, alt_agl).
+    search_corners: optional 4-corner search area. If given, the two
+                    computed mapping-pass points (entry/exit of the
+                    straight-line pass) are added as plain waypoints
+                    after the laps, purely so they show up for visual
+                    pre-flight verification in Mission Planner/QGC.
+                    This is safe because the uploaded AUTO mission is
+                    never actually flown -- GUIDED-mode fly_to() calls
+                    drive the real flight -- so adding preview-only
+                    points here changes nothing about actual behavior.
     """
     home_lat = home_lat if home_lat is not None else takeoff_lat
     home_lon = home_lon if home_lon is not None else takeoff_lon
@@ -84,6 +94,14 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                 items.append(_make_wp(len(items), lat, lon, alt))
             items.append(_make_wp(len(items), lat, lon, alt))
             prev_alt = alt
+
+    # Mapping-pass preview points (visual verification only — see docstring)
+    if search_corners and len(search_corners) == 4:
+        corners_latlon = [(c[0], c[1]) for c in search_corners]
+        pass_alt = search_corners[0][2] if len(search_corners[0]) > 2 else config.MISSION_ALT
+        pass_points = build_straight_line_path(corners_latlon, alt=pass_alt)
+        for lat, lon, alt in pass_points:
+            items.append(_make_wp(len(items), lat, lon, alt))
 
     # RTL
     items.append(_make_wp(len(items), home_lat, home_lon,

@@ -90,6 +90,12 @@ class MissionController:
         self.camera = None
         self.cam_active = False
         self.click_to_fly_enabled = False
+        self.click_mode = "fly"   # "fly" or "pin" -- what a camera click does
+
+        # object pins (click-to-pin) + route planning
+        self.pins = []               # [{id, name, lat, lon, distance_m}, ...]
+        self.mapping_exit_point = None   # (lat, lon) -- where the mapping pass ended
+        self.home_point = None           # (lat, lon) -- RTL destination for this mission
 
         # dedicated read-only connection for incoming Pi STATUSTEXT messages
         # (separate socket from self.conn — never races the mission thread's
@@ -97,6 +103,7 @@ class MissionController:
         self.status_conn = None
         self.status_listener_thread = None
         self.status_listener_running = False
+        self.pi_link_uri = None   # None -> Pi commands go via self.conn (normal, one Pixhawk)
 
         # Image receiver (standard MAVLink messages only — STATUSTEXT +
         # DATA_TRANSMISSION_HANDSHAKE + ENCAPSULATED_DATA, no custom dialect) —
@@ -127,10 +134,12 @@ class MissionController:
             "awaiting_post_lap": False,
             "search_available": False,
             "click_to_fly_enabled": False,
+            "click_mode": "fly",
             "status_text": "Ready",
             "status_level": "info",
             "armed": False,
             "conn_active": False,
+            "pi_link_uri": None,
             "cam_active": False,
             "pi_link_active": False,
             "pi_last_message": None,
@@ -279,26 +288,78 @@ class MissionController:
         self._push_state()
 
     # ── Pi signalling (text commands over STATUSTEXT) ───────────
+    def _pi_conn(self):
+        """The connection actually used to talk TO the Pi (commands, acks).
+
+        Normally this is the same connection as the vehicle (self.conn) —
+        there's only one Pixhawk, so the vehicle link IS the Pi link.
+
+        If a dedicated Pi Link URI is configured, this is status_conn
+        instead. That's for exactly one situation: testing with SITL for
+        safe simulated flight WHILE a real Pixhawk sits on the bench,
+        wired to the real Pi, purely to validate the actual production
+        message-relay hardware chain (the part that's turned out to have
+        real bugs before — routing/forwarding behavior, not website code).
+        In that setup self.conn talks to SITL and has nothing to do with
+        the Pi at all, so commands have to go out over the separate real
+        connection instead.
+        """
+        if self.pi_link_uri and self.status_conn is not None:
+            return self.status_conn
+        return self.conn
+
+    def set_pi_link_uri(self, uri: str):
+        """Empty/None -> normal single-Pixhawk behavior (commands go out
+        over the vehicle connection). Non-empty -> commands/acks go out
+        over a separate connection to that URI instead — see _pi_conn()."""
+        self.pi_link_uri = uri or None
+        with self.lock:
+            self.state["pi_link_uri"] = self.pi_link_uri
+        self._push_state()
+        if self.pi_link_uri:
+            self._log(f"[PI-LINK] Using dedicated Pi link: {self.pi_link_uri} "
+                     f"(commands go here, not the vehicle connection)", "info")
+        else:
+            self._log("[PI-LINK] Using the vehicle connection for Pi commands (normal mode).", "info")
+
+        # The SENDING side (_pi_conn()) re-checks pi_link_uri fresh every
+        # call, so it switches targets immediately. The RECEIVING side
+        # (the status listener) is a persistent connection that only
+        # opens once -- if it's already running on the OLD target, it'll
+        # just sit there while commands go to the NEW target and nothing
+        # answers. Restart it so both sides actually match.
+        if self.status_listener_running:
+            self._log("[PI-LINK] Restarting listener so receiving matches the new target...", "info")
+            self.stop_status_listener()
+            threading.Thread(target=self._restart_status_listener, daemon=True).start()
+
+    def _restart_status_listener(self):
+        time.sleep(0.5)   # let the old connection actually close first
+        self.start_status_listener()
+
     def send_text_command(self, command: str, label: str):
-        if self.conn is None:
+        conn = self._pi_conn()
+        if conn is None:
             self._log(f"[PI-CMD] Not connected — cannot send {label}.", "error")
             return
         from pymavlink import mavutil
         payload = command.encode("utf-8")[:50]
         try:
-            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, payload)
+            conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, payload)
             self._log(f"[PI-CMD] {label} → sent '{command}'", "info")
         except Exception as e:
             self._log(f"[PI-CMD] {label} failed: {e}", "error")
 
-    # ── Pi status listener (dedicated read-only connection) ─────
+    # ── Pi status listener (dedicated connection — read-only in normal
+    # mode, but also used for writes when pi_link_uri makes it the ONLY
+    # connection to the Pi, since then there's no self.conn to conflict with) ──
     _SEVERITY_TO_LEVEL = {0: "error", 1: "error", 2: "error", 3: "error",
                           4: "warn", 5: "warn", 6: "info", 7: "plain"}
 
     def start_status_listener(self, uri: str = None):
         if self.status_listener_running:
             return
-        target_uri = uri or config.default_status_uri()
+        target_uri = uri or self.pi_link_uri or config.default_status_uri()
 
         def _run():
             from connection import connect as _connect
@@ -397,22 +458,22 @@ class MissionController:
         before it considers the transfer done. Sent multiple times if the
         sender keeps nudging with IMGDONE (meaning our first ack likely
         got lost on the way) -- idempotent on the sender's side either way."""
-        if self.conn is None:
+        conn = self._pi_conn()
+        if conn is None:
             return
         prefix = IMGACK_PREFIX if ok else IMGFAIL_PREFIX
         text = f"{prefix}{image_id:08x}"
         try:
-            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode("utf-8")[:50])
+            conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode("utf-8")[:50])
         except Exception as e:
             self._log(f"[IMG] Failed to send {'ack' if ok else 'fail'} confirmation: {e}", "error")
 
     def _on_image_resend_request(self, image_id: int, missing_seqs: list):
-        """Sends an IMGRESEND STATUSTEXT back to the Pi over the normal
-        read/write connection (the status listener is read-only, so this
-        can't go out over that one). A STATUSTEXT is capped at 50 bytes,
-        so a long list of missing packet numbers gets split across
-        multiple messages rather than silently truncated/corrupted."""
-        if self.conn is None:
+        """Sends an IMGRESEND STATUSTEXT back to the Pi over whichever
+        connection actually reaches it (_pi_conn()). A STATUSTEXT is
+        capped at 50 bytes, so a long list of missing packet numbers gets
+        split across multiple messages rather than silently truncated/corrupted."""
+        if self._pi_conn() is None:
             self._log("[IMG] Cannot request resend — not connected.", "warn")
             return
         prefix = f"IMGRESEND:{image_id:08x}:"
@@ -434,7 +495,7 @@ class MissionController:
     def _send_resend_batch(self, prefix: str, batch: list):
         text = prefix + ",".join(batch)
         try:
-            self.conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode("utf-8")[:50])
+            self._pi_conn().mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode("utf-8")[:50])
         except Exception as e:
             self._log(f"[IMG] Failed to send resend request: {e}", "error")
 
@@ -605,13 +666,125 @@ class MissionController:
         self._push_state()
         self._set_status("Mapping complete — click the camera feed to fly to that GPS point", "info")
 
+    def set_click_mode(self, mode: str):
+        if mode not in ("fly", "pin"):
+            return
+        self.click_mode = mode
+        with self.lock:
+            self.state["click_mode"] = mode
+        self._push_state()
+        self._log(f"[CLICK] Mode → {mode}", "info")
+
     def on_camera_click(self, px: float, py: float, w: int, h: int):
         if not self.click_to_fly_enabled or self.conn is None:
             return
-        self._log(f"[CLICK] pixel=({px:.0f},{py:.0f}) of {w}x{h}", "info")
-        from flight import fly_to_clicked_point
-        threading.Thread(target=fly_to_clicked_point,
-                         args=(self.conn, px, py, w, h), daemon=True).start()
+        self._log(f"[CLICK] pixel=({px:.0f},{py:.0f}) of {w}x{h}  mode={self.click_mode}", "info")
+        if self.click_mode == "pin":
+            threading.Thread(target=self._add_pin_from_click, args=(px, py, w, h), daemon=True).start()
+        else:
+            from flight import fly_to_clicked_point
+            threading.Thread(target=fly_to_clicked_point,
+                             args=(self.conn, px, py, w, h), daemon=True).start()
+
+    def _add_pin_from_click(self, px, py, w, h):
+        from flight import localize_pixel_click
+        result = localize_pixel_click(self.conn, px, py, w, h)
+        if result is None:
+            self._log("[PIN] Could not localize click — missing GPS/attitude.", "error")
+            return
+        lat, lon = result
+        pin_id = (self.pins[-1]["id"] + 1) if self.pins else 1
+        name = f"OBJ{pin_id}"
+        pin = {"id": pin_id, "name": name, "lat": lat, "lon": lon, "distance_m": None}
+        self.pins.append(pin)
+        self._log(f"[PIN] Added {name} @ {lat:.7f}, {lon:.7f}", "ok")
+        self._emit_pins()
+
+    def clear_pins(self):
+        self.pins = []
+        self._emit_pins()
+        self._log("[PIN] Cleared all pins.", "info")
+
+    def _emit_pins(self):
+        self._emit({"type": "pins_update", "pins": list(self.pins)})
+
+    def _on_mapping_position(self, lat, lon):
+        """Piggybacked on fly_to()'s existing position reads during the
+        mapping pass — no separate reader thread, no concurrency risk."""
+        self._recompute_pin_distances(lat, lon)
+
+    def _recompute_pin_distances(self, cur_lat, cur_lon):
+        if not self.pins:
+            return
+        from geo import distance_m
+        for pin in self.pins:
+            pin["distance_m"] = round(distance_m(cur_lat, cur_lon, pin["lat"], pin["lon"]), 1)
+        self._emit_pins()
+
+    def suggest_route(self):
+        """Fixed start (mapping-pass exit point) and fixed end (home/RTL
+        point), brute-force every ordering of the pinned points in
+        between. For the handful of points this realistically has, exact
+        brute force is instant — no heuristic/approximation needed."""
+        from geo import distance_m
+        import itertools
+
+        if not self.pins:
+            return {"order": [], "names": [], "total_distance_m": 0.0}
+
+        start = self.mapping_exit_point
+        end = self.home_point
+        if start is None and self.pins:
+            start = (self.pins[0]["lat"], self.pins[0]["lon"])
+        if end is None and self.pins:
+            end = (self.pins[-1]["lat"], self.pins[-1]["lon"])
+
+        best_order, best_dist = None, None
+        for perm in itertools.permutations(self.pins):
+            total = distance_m(start[0], start[1], perm[0]["lat"], perm[0]["lon"])
+            for a, b in zip(perm, perm[1:]):
+                total += distance_m(a["lat"], a["lon"], b["lat"], b["lon"])
+            total += distance_m(perm[-1]["lat"], perm[-1]["lon"], end[0], end[1])
+            if best_dist is None or total < best_dist:
+                best_dist = total
+                best_order = perm
+
+        return {
+            "order": [p["id"] for p in best_order],
+            "names": [p["name"] for p in best_order],
+            "total_distance_m": round(best_dist, 1),
+        }
+
+    def fly_to_pin(self, pin_id: int):
+        if self.conn is None:
+            self._log("[PIN] Not connected.", "error")
+            return
+        pin = next((p for p in self.pins if p["id"] == pin_id), None)
+        if pin is None:
+            self._log(f"[PIN] No such pin: {pin_id}", "error")
+            return
+        from flight import fly_to
+        self._log(f"[PIN] Flying to {pin['name']} @ {pin['lat']:.7f},{pin['lon']:.7f}", "info")
+        threading.Thread(target=fly_to,
+                         args=(self.conn, pin["lat"], pin["lon"], config.MISSION_ALT),
+                         daemon=True).start()
+
+    def fly_route(self, order: list):
+        if self.conn is None:
+            self._log("[ROUTE] Not connected.", "error")
+            return
+
+        def _run():
+            from flight import fly_to
+            for pin_id in order:
+                pin = next((p for p in self.pins if p["id"] == pin_id), None)
+                if pin is None:
+                    continue
+                self._log(f"[ROUTE] → {pin['name']}", "info")
+                fly_to(self.conn, pin["lat"], pin["lon"], config.MISSION_ALT)
+            self._log("[ROUTE] Route complete. Use RTL/Abort to return home.", "ok")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def on_alt_key(self, direction: str):
         if not self.click_to_fly_enabled or self.conn is None:
@@ -626,6 +799,9 @@ class MissionController:
         if self.mission_thread and self.mission_thread.is_alive():
             self._log("[MAIN] Mission already running.", "warn")
             return
+        self.clear_pins()
+        self.mapping_exit_point = None
+        self.home_point = None
         with self.lock:
             self.state["mission_running"] = True
         self._push_state()
@@ -645,7 +821,8 @@ class MissionController:
             # Phase 1 — save preview waypoints, wait for operator to verify
             p0 = params.waypoints[0]
             items = build_items(p0[0], p0[1], params.waypoints, params.laps,
-                                home_lat=p0[0], home_lon=p0[1])
+                                home_lat=p0[0], home_lon=p0[1],
+                                search_corners=params.search_corners)
             save_waypoints_file(items)
             self._log(f"✓ {WP_FILE} saved — load in MP PLAN tab to verify.", "ok")
             self._log("After verifying waypoints in Mission Planner, click Continue →", "info")
@@ -670,11 +847,13 @@ class MissionController:
             home_lat = cfg.HOME_LAT or take_lat
             home_lon = cfg.HOME_LON or take_lon
             home_alt = cfg.HOME_ALT_MSL or alt_msl
+            self.home_point = (home_lat, home_lon)
             self._log(f"[MAIN] Takeoff: {take_lat:.8f}, {take_lon:.8f}", "info")
             self._log(f"[MAIN] HOME   : {home_lat:.8f}, {home_lon:.8f}", "info")
 
             items = build_items(take_lat, take_lon, params.waypoints, params.laps,
-                                home_lat=home_lat, home_lon=home_lon)
+                                home_lat=home_lat, home_lon=home_lon,
+                                search_corners=params.search_corners)
             save_waypoints_file(items)
             set_param(conn, "RTL_ALT", cfg.MISSION_ALT * 100)
             upload_mission(conn, items)
@@ -721,9 +900,38 @@ class MissionController:
                 self._log("[MAIN] ── Search / mapping ──", "info")
                 for i, (lat, lon, alt) in enumerate(path, 1):
                     self._log(f"[SEARCH] Leg {i}/{len(path)}", "info")
-                    if not fly_to(conn, lat, lon, alt):
+
+                    if i == 1:
+                        # Trigger on COMMENCEMENT of the entry leg, not arrival —
+                        # the command's travel time then overlaps with the flight
+                        # time to get there, instead of stacking as dead time
+                        # after arrival.
+                        self.send_text_command(config.CMD_RECORD_START,
+                                              "Auto: Start Recording (mapping pass)")
+
+                    near_cb = None
+                    if i == len(path):
+                        # Heads-up as we approach the exit point — a second,
+                        # independent sanity check on top of having already
+                        # visually verified these points in the pre-flight
+                        # waypoints file.
+                        near_cb = lambda d: self._log(
+                            f"[SEARCH] Approaching pass exit (~{d:.0f}m) — recording will stop soon.",
+                            "info")
+
+                    if not fly_to(conn, lat, lon, alt, near_cb=near_cb,
+                                  position_cb=self._on_mapping_position):
                         raise TimeoutError(f"Search leg {i} timeout")
+
+                    if i == len(path):
+                        # No further leg to hide this behind, so this one is
+                        # arrival-based and may run a little past the true
+                        # edge — acceptable per the "even it will be late" call.
+                        self.send_text_command(config.CMD_RECORD_STOP,
+                                              "Auto: Stop Recording (mapping pass)")
+
                 self._log("[SEARCH] Mapping complete ✓", "ok")
+                self.mapping_exit_point = (path[-1][0], path[-1][1])
 
                 self._enable_click_to_fly()
                 self._log("[MAIN] Click the Camera Feed tab to fly to a marked object's real "
