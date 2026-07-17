@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import webbrowser
-
 import uvicorn
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
