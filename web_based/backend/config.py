@@ -31,7 +31,7 @@ HOME_LON     = None
 HOME_ALT_MSL = None
 
 # ----- Altitudes (AGL metres) ----------------------------------
-MISSION_ALT  = 5
+MISSION_ALT  = 18
 
 # ----- Mission behaviour ---------------------------------------
 DEFAULT_LAPS             = 1
