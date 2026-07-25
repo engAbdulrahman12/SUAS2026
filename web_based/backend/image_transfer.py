@@ -130,11 +130,17 @@ class AdaptiveRateLimiter:
 
 class ImageSender:
     def __init__(self, config: ImageTransferConfig = DEFAULT_CONFIG,
-                progress_cb=None, status_cb=None):
+                progress_cb=None, status_cb=None, lock=None):
+        """lock: pass in the SAME lock your script already uses for other
+        master.mav.*_send() calls (e.g. around STATUSTEXT sends), so this
+        sender's writes are actually mutually exclusive with everything
+        else writing to the same connection. If not given, this creates
+        its own -- which only protects against itself, not against other
+        code writing to the same port from a different thread."""
         self.cfg = config
         self.progress_cb = progress_cb or (lambda *a: None)
         self.status_cb = status_cb or print
-        self._lock = threading.Lock()
+        self._lock = lock or threading.Lock()
 
     def _send_packet(self, master, seq: int, data: bytes):
         chunk = data[seq * CHUNK_SIZE: seq * CHUNK_SIZE + CHUNK_SIZE]
@@ -197,7 +203,7 @@ class ImageSender:
                 self.status_cb(f"Sending packet {i + 1} / {total_packets} - Progress: {pct}%")
 
         self._send_done(master, image_id)
-        self.status_cb(f"[IMG] First pass complete: {image_path.name} — "
+        self.status_cb(f"[IMG] First pass complete: {image_path.name} - "
                        f"waiting for ground station confirmation...")
 
         # Wait for IMGACK / IMGFAIL, resending whatever's requested, until
@@ -215,11 +221,11 @@ class ImageSender:
                     text = (msg.text or "").rstrip("\x00")
                     if text.startswith(IMGACK_PREFIX):
                         if self._id_matches(text, IMGACK_PREFIX, image_id):
-                            self.status_cb("[IMG] Ground station confirmed receipt ✓ — transfer complete.")
+                            self.status_cb("[IMG] Ground station confirmed receipt - transfer complete.")
                             return True
                     elif text.startswith(IMGFAIL_PREFIX):
                         if self._id_matches(text, IMGFAIL_PREFIX, image_id):
-                            self.status_cb("[IMG] Ground station reported failure (CRC mismatch) — stopping.")
+                            self.status_cb("[IMG] Ground station reported failure (CRC mismatch) - stopping.")
                             return False
                     elif text.startswith(IMGRESEND_PREFIX):
                         missing = self._parse_resend(text, image_id)
@@ -322,7 +328,7 @@ class ImageReceiver:
         that's bounded on the sender side by max_total_wait_s instead."""
         t = self._transfer
         if t is not None and time.time() - t["last_progress"] > self.cfg.timeout_s:
-            self.on_log(f"[IMG] Transfer stalled ({self.cfg.timeout_s:.0f}s no data at all) — abandoning.")
+            self.on_log(f"[IMG] Transfer stalled ({self.cfg.timeout_s:.0f}s no data at all) - abandoning.")
             self.on_complete(None, False, "stalled")
             self._transfer = None
 
@@ -386,7 +392,7 @@ class ImageReceiver:
             return
 
         t["last_progress"] = time.time()
-        self.on_log(f"[IMG] {len(missing)} packet(s) missing — requesting resend")
+        self.on_log(f"[IMG] {len(missing)} packet(s) missing - requesting resend")
         self.on_resend_request(image_id, missing)
 
     def _finish(self):

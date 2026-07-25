@@ -202,16 +202,54 @@ async def mission_post_lap(body: PostLapBody):
     return {"ok": True}
 
 
+@app.post("/api/mission/skip_to_search")
+async def skip_to_search():
+    ctl.skip_to_search()
+    return {"ok": True}
+
+
+@app.post("/api/mission/start_guided_backup")
+async def start_guided_backup():
+    ctl.start_guided_backup()
+    return {"ok": True}
+
+
 @app.post("/api/mission/abort")
 async def mission_abort():
     ctl.abort()
     return {"ok": True}
 
 
+@app.get("/api/checklist")
+async def get_checklist():
+    return ctl.get_checklist()
+
+
+class OverrideBody(BaseModel):
+    name: str
+    enabled: bool
+
+
+@app.post("/api/checklist/override")
+async def set_override(body: OverrideBody):
+    ctl.set_override(body.name, body.enabled)
+    return {"ok": True}
+
+
+class EngineeringModeBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/checklist/engineering_mode")
+async def set_engineering_mode(body: EngineeringModeBody):
+    ctl.set_engineering_mode(body.enabled)
+    return {"ok": True}
+
+
 @app.get("/api/state")
 async def get_state():
     return {"state": dict(ctl.state), "log": ctl.log_history[-200:], "pi_log": ctl.pi_log_history[-200:],
-           "pins": ctl.pins}
+           "pins": ctl.pins, "checklist": ctl.get_checklist()}
 
 
 @app.get("/api/config")
@@ -302,6 +340,16 @@ class AltBody(BaseModel):
 @app.post("/api/camera/alt")
 async def camera_alt(body: AltBody):
     ctl.on_alt_key(body.direction)
+    return {"ok": True}
+
+
+class SetAltBody(BaseModel):
+    alt: float
+
+
+@app.post("/api/camera/set_alt")
+async def camera_set_alt(body: SetAltBody):
+    ctl.set_altitude(body.alt)
     return {"ok": True}
 
 

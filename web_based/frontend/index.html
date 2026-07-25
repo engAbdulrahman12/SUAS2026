@@ -90,6 +90,7 @@
         <button class="tab-btn active" data-tab="wp">Mission Waypoints</button>
         <button class="tab-btn" data-tab="search">Search Area</button>
         <button class="tab-btn" data-tab="cam">Camera Feed</button>
+        <button class="tab-btn" data-tab="preflight">Pre-Flight</button>
       </div>
 
       <!-- Waypoints tab -->
@@ -165,7 +166,7 @@
           <hr>
           <div class="field-row" style="flex-wrap:wrap; gap:10px;" id="piLinkRow">
             <span class="field-label" style="width:auto;">Pi Link URI (optional)</span>
-            <input id="piLinkUriInput" type="text" class="mono" style="width:220px;" placeholder="leave blank = normal">
+            <input id="piLinkUriInput" type="text" class="mono" style="width:220px;" placeholder="e.g. COM8 (no baud needed)">
             <button id="btnSetPiLinkUri" class="btn btn-mini">Set</button>
           </div>
           <p class="muted small" id="piLinkHint">Leave blank for normal operation (one Pixhawk handles both flight and Pi commands). Set this to a separate connection string only when testing with SITL for flight WHILE a real Pixhawk on the bench relays Pi commands — validates the real hardware path without flying.</p>
@@ -184,14 +185,19 @@
           </div>
           <p class="muted small">Webcam: device index (usually <code class="mono">0</code>). RTSP: full stream URL. The feed runs independently of the mission — start it anytime to check it on the bench.</p>
           <p id="camInfo" class="muted small"></p>
-          <p class="muted small">Click the feed to fly the drone to that real-world GPS point (only enabled once click-to-fly is active). Press U to climb / D to descend after clicking once.</p>
+          <p class="muted small">Click the feed to fly the drone to that real-world GPS point — moves in X/Y only, altitude stays wherever it currently is. Press U to climb / D to descend, or set an exact altitude below.</p>
+          <div class="field-row" style="margin-top:4px;">
+            <span class="field-label" style="width:auto;margin-right:6px;">Set altitude (m):</span>
+            <input id="setAltInput" type="number" step="0.5" class="mono" style="width:90px;" placeholder="e.g. 15">
+            <button id="btnSetAlt" class="btn btn-mini">Go</button>
+          </div>
           <div class="field-row" style="margin-top:8px;">
             <span class="field-label" style="width:auto;margin-right:6px;">Click mode:</span>
             <div class="btn-group">
-              <button id="btnClickFly" class="btn btn-toggle active">Fly</button>
-              <button id="btnClickPin" class="btn btn-toggle">Pin object</button>
+              <button id="btnClickFly" class="btn btn-toggle">Fly</button>
+              <button id="btnClickPin" class="btn btn-toggle active">Pin object</button>
             </div>
-            <span class="muted small" style="margin-left:8px;">Pin mode marks a coordinate instead of flying there.</span>
+            <span class="muted small" style="margin-left:8px;">Defaults to Pin (safer). Fly mode stays locked until the mapping/search pass finishes.</span>
           </div>
         </div>
 
@@ -241,11 +247,50 @@
           <div id="camPlaceholder" class="cam-placeholder">Camera feed inactive</div>
         </div>
       </div>
+
+      <!-- Pre-Flight checklist tab -->
+      <div class="tab-panel" id="tab-preflight">
+        <div id="engBanner" class="card" style="display:none; border-color: var(--acc-amber); background: rgba(255,176,32,0.08);">
+          <strong style="color: var(--acc-amber);">ENGINEERING MODE — Safety Overrides Enabled</strong>
+        </div>
+
+        <div class="card">
+          <div class="field-row" style="flex-wrap:wrap; gap:14px;">
+            <div class="btn-group">
+              <button id="btnCompetitionMode" class="btn btn-toggle active">Competition Mode</button>
+              <button id="btnEngineeringMode" class="btn btn-toggle">Engineering Mode</button>
+            </div>
+            <span class="muted small">Competition Mode disables all overrides. Only switch to Engineering Mode for bench testing.</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="field-row" style="flex-wrap:wrap; gap:18px;">
+            <span id="clPassed" class="small">Passed: 0</span>
+            <span id="clFailed" class="small">Failed: 0</span>
+            <span id="clWarn" class="small">Overridden/Warning: 0</span>
+            <span id="clWaiting" class="small">Waiting: 0</span>
+            <span class="tb-spacer"></span>
+            <span id="clOverall" class="badge">NOT READY</span>
+          </div>
+        </div>
+
+        <div class="card" style="padding:0;">
+          <table class="wp-table" style="margin:0;">
+            <thead>
+              <tr><th style="width:90px;">Status</th><th>Check</th><th>Current</th><th>Required</th><th style="width:80px;">Override</th><th>Details</th></tr>
+            </thead>
+          </table>
+          <div id="checklistRows"></div>
+        </div>
+      </div>
     </section>
   </main>
 
   <footer class="footbar">
     <button id="btnAbort" class="btn btn-danger btn-abort" disabled>⚠ RTL / ABORT</button>
+    <button id="btnSkipLaps" class="btn btn-mini" disabled title="Ends the remaining laps early and heads straight to the search/mapping line">Skip to Search Line</button>
+    <button id="btnGuidedBackup" class="btn btn-mini" disabled title="Safety backup: fly the laps in GUIDED per-waypoint instead of waiting for/using AUTO">Start as Guided Mode</button>
     <span id="statusLbl" class="status-lbl">Ready</span>
     <div class="footbar-right">
       <button id="btnContinue" class="btn btn-primary" style="display:none">Continue →</button>

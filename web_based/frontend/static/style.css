@@ -203,6 +203,22 @@ select:disabled, input:disabled { color: var(--muted-2); border-color: var(--hai
 .pin-row .pin-coords { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); flex: 1; }
 .pin-row .pin-dist { font-family: var(--font-mono); font-size: 12px; width: 80px; text-align: right; flex: none; }
 
+.cl-row {
+  display: grid; grid-template-columns: 90px 1fr 130px 130px 80px 1fr;
+  gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--hairline);
+  font-size: 12.5px;
+}
+.cl-row:last-child { border-bottom: none; }
+.cl-status { font-weight: 800; letter-spacing: 0.3px; }
+.cl-status.pass { color: var(--acc-green); }
+.cl-status.fail { color: var(--acc-red); }
+.cl-status.warn { color: var(--acc-amber); }
+.cl-status.waiting { color: var(--muted); }
+.cl-current, .cl-required { font-family: var(--font-mono); color: var(--muted); }
+.cl-details { color: var(--muted); font-size: 11.5px; }
+.cl-row.fail { background: rgba(255,77,94,0.06); }
+.cl-row.warn { background: rgba(255,176,32,0.06); }
+
 #piLinkRow.hybrid-active {
   outline: 2px solid var(--acc-amber); outline-offset: 4px; border-radius: 8px;
 }

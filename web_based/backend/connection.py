@@ -23,9 +23,22 @@ def connect(uri: str | None = None, baud: int | None = None) -> mavutil.mavfile:
     uri  = uri  or config.default_uri()
     baud = baud or config.BAUD_RATE
 
+    is_serial = uri.upper().startswith("COM") or uri.startswith("/dev/")
+
+    if is_serial and ":" in uri:
+        # pymavlink's own generic device parser treats ANY colon-containing
+        # string that isn't a recognized network prefix (tcp:/udp:/etc) as
+        # a host:port UDP address -- exactly backwards for something like
+        # "COM8:57600" (a serial port with an inline baud rate). Split it
+        # ourselves so a COM/serial URI never gets misrouted as a network
+        # address no matter which format someone types it in.
+        device_part, _, baud_part = uri.partition(":")
+        uri = device_part
+        if baud_part.strip().isdigit():
+            baud = int(baud_part.strip())
+
     print(f"[CONN] Connecting → {uri}")
 
-    is_serial = uri.upper().startswith("COM") or uri.startswith("/dev/")
     kw = {"baud": baud} if is_serial else {}
 
     try:

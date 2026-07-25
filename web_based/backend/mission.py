@@ -46,6 +46,11 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                 search_corners: list[tuple[float, float, float]] = None) -> list[dict]:
     """Build the ordered list of mission item dicts.
 
+    Returns (items, first_lap_idx, after_laps_idx) -- the latter two let
+    the caller run the lap sequence in AUTO mode and know exactly which
+    mission-item index to start at and which index marks "laps are done,
+    hand control back" (see controller.py's _run()).
+
     home_lat / home_lon: RTL return point.  Pass the drone's actual GPS
                          position (resolved in main.py).  If None, falls
                          back to takeoff position — so RTL goes back to
@@ -65,13 +70,6 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
     home_lon = home_lon if home_lon is not None else takeoff_lon
     home_alt = config.HOME_ALT_MSL if config.HOME_ALT_MSL is not None else 0.0
 
-    for i, wp in enumerate(waypoints, 1):
-        lat, lon = wp[0], wp[1]
-        d = distance_m(home_lat, home_lon, lat, lon)
-        if d > config.MAX_DISTANCE_FROM_HOME_M:
-            raise ValueError(f"WP {i} is {d:.0f} m from HOME "
-                             f"(limit {config.MAX_DISTANCE_FROM_HOME_M} m)")
-
     items = []
 
     # Item 0 — HOME (absolute MSL)
@@ -83,6 +81,7 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                           cmd=22, frame=_REL, current=1, p2=0))
 
     # Lap waypoints (with per-waypoint altitude + alt-change inserts)
+    first_lap_idx = len(items)
     for _ in range(laps):
         prev_alt = config.MISSION_ALT
         for wp in waypoints:
@@ -94,6 +93,7 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                 items.append(_make_wp(len(items), lat, lon, alt))
             items.append(_make_wp(len(items), lat, lon, alt))
             prev_alt = alt
+    after_laps_idx = len(items)   # first item index that is NOT a lap waypoint
 
     # Mapping-pass preview points (visual verification only — see docstring)
     if search_corners and len(search_corners) == 4:
@@ -110,7 +110,7 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
     # Renumber
     for i, it in enumerate(items):
         it["seq"] = i
-    return items
+    return items, first_lap_idx, after_laps_idx
 
 
 def build_straight_line_path(corners: list[tuple[float, float]],

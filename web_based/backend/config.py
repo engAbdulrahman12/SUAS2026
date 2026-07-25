@@ -35,8 +35,40 @@ MISSION_ALT  = 5
 
 # ----- Mission behaviour ---------------------------------------
 DEFAULT_LAPS             = 1
-WP_ACCEPT_RADIUS_M       = 3.0
-MAX_DISTANCE_FROM_HOME_M = 100000
+
+# ----- Speed + yaw behavior, laps vs. search/mapping pass -------
+# LAP_SPEED_MS: set this to your vehicle's actual configured max cruise
+# speed (matching whatever WPNAV_SPEED is tuned to on the flight
+# controller, converted to m/s) -- this can't be safely guessed here,
+# it depends entirely on your specific vehicle's tuning.
+LAP_SPEED_MS    = 12.0    # CHANGE THIS to your vehicle's real max speed
+SEARCH_SPEED_MS = 5.0     # slower, deliberate speed for stable mapping video
+
+WP_YAW_BEHAVIOR_LAPS   = 0   # 0 = never change yaw (ArduPilot WP_YAW_BEHAVIOR)
+WP_YAW_BEHAVIOR_SEARCH = 1   # 1 = face next waypoint
+
+# ----- Pre-flight checklist thresholds ---------------------------
+# Tune these to your team's actual policy -- see checklist.py for the
+# checks themselves.
+CHECKLIST_CONFIG = {
+    "min_satellites": 10,
+    "max_hdop": 2.0,
+    "min_battery_voltage": 22.0,
+    "min_battery_pct": 30,
+    "acceptable_modes": ["GUIDED", "LOITER", "STABILIZE"],
+}
+WP_ACCEPT_RADIUS_M       = 3.0    # click-to-fly, search/map pass, altitude changes -- needs to be
+                                   # exact, "reached" should mean the real point, not just nearby
+LAP_ACCEPT_RADIUS_M      = 30.0   # GUIDED lap flying ONLY -- looser on purpose: switching to the
+                                   # next target earlier lets the flight controller curve smoothly
+                                   # toward it instead of fully stopping at each waypoint, which is
+                                   # faster and uses less power over a whole lap sequence. Within
+                                   # the SUAS 100ft (30.5m) waypoint-capture rule.
+# MAX_DISTANCE_FROM_HOME_M is no longer enforced in mission.py -- waypoints
+# are visually verified in Mission Planner before Continue anyway, which
+# already covers this. Left here unused rather than deleted, in case a
+# hard limit is ever wanted again.
+MAX_DISTANCE_FROM_HOME_M = 500.0
 
 # ----- GPS readiness -------------------------------------------
 MIN_GPS_FIX_TYPE = 0

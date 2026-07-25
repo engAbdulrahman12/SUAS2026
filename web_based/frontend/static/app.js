@@ -45,16 +45,25 @@ const mavStatus = $("mavStatus");
 const btnSim = $("btnSim"), btnReal = $("btnReal"), btnHybrid = $("btnHybrid");
 const piLinkRow = $("piLinkRow"), piLinkHint = $("piLinkHint");
 const btnAbort = $("btnAbort"), btnStart = $("btnStart"), btnContinue = $("btnContinue");
+const btnSkipLaps = $("btnSkipLaps");
+const btnGuidedBackup = $("btnGuidedBackup");
 const statusLbl = $("statusLbl");
 const camImg = $("camImg"), camPlaceholder = $("camPlaceholder"), camInfo = $("camInfo");
 const btnCamWebcam = $("btnCamWebcam"), btnCamRtsp = $("btnCamRtsp"), camSourceInput = $("camSourceInput"),
       btnCamStart = $("btnCamStart"), btnCamStop = $("btnCamStop");
 const btnConnect = $("btnConnect"), btnDisconnect = $("btnDisconnect"), connDot2 = $("connDot2");
+const btnCompetitionMode = $("btnCompetitionMode"), btnEngineeringMode = $("btnEngineeringMode");
+const engBanner = $("engBanner"), checklistRows = $("checklistRows");
+const clPassed = $("clPassed"), clFailed = $("clFailed"), clWarn = $("clWarn"),
+      clWaiting = $("clWaiting"), clOverall = $("clOverall");
+let checklistReady = false;
 const piLinkUriInput = $("piLinkUriInput"), btnSetPiLinkUri = $("btnSetPiLinkUri");
 const btnClickFly = $("btnClickFly"), btnClickPin = $("btnClickPin");
+const setAltInput = $("setAltInput"), btnSetAlt = $("btnSetAlt");
 const pinsList = $("pinsList"), pinsEmpty = $("pinsEmpty"), routeSuggestion = $("routeSuggestion");
 const btnSuggestRoute = $("btnSuggestRoute"), btnClearPins = $("btnClearPins");
 let pins = [];
+let lastChecklistData = null;
 let camMode = "webcam";
 const btnPiRecordStart = $("btnPiRecordStart"), btnPiRecordStop = $("btnPiRecordStop"),
       btnPiProcessStart = $("btnPiProcessStart"), btnPiSendMap = $("btnPiSendMap");
@@ -82,6 +91,7 @@ function connectWs() {
     else if (msg.type === "pi_status") showPiMessage(msg.text, msg.level, msg.ts);
     else if (msg.type === "map_transfer") handleMapTransfer(msg);
     else if (msg.type === "pins_update") { pins = msg.pins; renderPins(); }
+    else if (msg.type === "checklist_update") { lastChecklistData = msg; renderChecklist(msg); }
   };
 }
 
@@ -139,11 +149,14 @@ function handleMapTransfer(msg) {
 function applyState(s) {
   state = { ...state, ...s };
   if (state.click_mode) setClickModeUi(state.click_mode);
+  if (state.engineering_mode !== undefined) setEngineeringModeUi(state.engineering_mode);
   if (state.pi_link_uri !== undefined && document.activeElement !== piLinkUriInput) {
     piLinkUriInput.value = state.pi_link_uri || "";
   }
   btnAbort.disabled = !(state.armed || state.mission_running);
-  btnStart.disabled = state.mission_running;
+  btnSkipLaps.disabled = !state.mission_running;
+  btnGuidedBackup.disabled = !state.mission_running;
+  btnStart.disabled = state.mission_running || (state.conn_active && !checklistReady);
   btnContinue.style.display = state.awaiting_continue ? "inline-block" : "none";
   mavStatus.textContent = state.mav_running ? `Running on ${state.mav_port || ""}` : "Stopped";
   mavStatus.style.color = state.mav_running ? "var(--acc-green)" : "var(--muted)";
@@ -191,6 +204,7 @@ async function initialSync() {
     for (const entry of data.log) appendLog(entry.text, entry.level);
     for (const entry of data.pi_log) showPiMessage(entry.text, entry.level, entry.ts);
     if (data.pins) { pins = data.pins; renderPins(); }
+    if (data.checklist) { lastChecklistData = data.checklist; renderChecklist(data.checklist); }
     applyState(data.state);
   } catch (e) { /* backend not up yet — WS retry loop will catch it */ }
 }
@@ -403,9 +417,17 @@ btnStart.addEventListener("click", () => {
   if (corners === "ERR") { alert("Fill all 4 search corners (lat/lon) or leave all blank."); return; }
 
   const modeTxt = state.sim ? "SIMULATION" : "REAL DRONE";
-  $("confirmText").textContent =
+  let confirmMsg =
     `Mode      : ${modeTxt}\nWaypoints : ${pts.length}\nLaps      : ${laps}\n` +
     `Search    : ${corners ? "4-corner area" : "SKIPPED"}\nURI       : ${uriInput.value.trim()}`;
+  const activeOverrides = lastChecklistData
+    ? lastChecklistData.results.filter((r) => r.overridden).map((r) => r.name)
+    : [];
+  if (activeOverrides.length) {
+    confirmMsg += `\n\nWARNING: The following safety checks are OVERRIDDEN:\n` +
+      activeOverrides.map((n) => ` - ${n}`).join("\n");
+  }
+  $("confirmText").textContent = confirmMsg;
   $("confirmModal").style.display = "flex";
   $("confirmModal")._payload = { pts, corners, uri: uriInput.value.trim() };
 });
@@ -427,6 +449,16 @@ btnContinue.addEventListener("click", () => postJson("/api/mission/continue", {}
 btnAbort.addEventListener("click", () => {
   if (!confirm("Command RTL and abort?")) return;
   postJson("/api/mission/abort", {});
+});
+
+btnSkipLaps.addEventListener("click", () => {
+  if (!confirm("Skip the remaining laps and head straight to the search/mapping line now?")) return;
+  postJson("/api/mission/skip_to_search", {});
+});
+
+btnGuidedBackup.addEventListener("click", () => {
+  if (!confirm("Stop waiting for AUTO and fly the laps in GUIDED mode instead, right now?")) return;
+  postJson("/api/mission/start_guided_backup", {});
 });
 
 function showPostLapModal(searchAvailable) {
@@ -488,6 +520,60 @@ btnCamStart.addEventListener("click", () => {
 });
 btnCamStop.addEventListener("click", () => postJson("/api/camera/stop", {}));
 
+btnCompetitionMode.addEventListener("click", () => postJson("/api/checklist/engineering_mode", { enabled: false }));
+btnEngineeringMode.addEventListener("click", () => postJson("/api/checklist/engineering_mode", { enabled: true }));
+
+function setEngineeringModeUi(enabled) {
+  btnCompetitionMode.classList.toggle("active", !enabled);
+  btnEngineeringMode.classList.toggle("active", enabled);
+  engBanner.style.display = enabled ? "block" : "none";
+}
+
+function toggleOverride(name, checked) {
+  if (checked && !confirm(`Override "${name}"? Only do this if you understand exactly why it's failing.`)) {
+    return false;
+  }
+  postJson("/api/checklist/override", { name, enabled: checked });
+  return true;
+}
+
+function renderChecklist(data) {
+  checklistReady = !!data.ready;
+  btnStart.disabled = state.mission_running || (state.conn_active && !checklistReady);
+
+  const counts = { pass: 0, fail: 0, warn: 0, waiting: 0 };
+  checklistRows.innerHTML = "";
+  for (const r of data.results) {
+    counts[r.status] = (counts[r.status] || 0) + 1;
+    const row = document.createElement("div");
+    row.className = `cl-row ${r.status}`;
+    const label = { pass: "PASS", fail: "FAIL", warn: r.overridden ? "OVERRIDDEN" : "WARN", waiting: "WAITING" }[r.status];
+    const overrideCell = r.can_override
+      ? `<label style="cursor:pointer;"><input type="checkbox" class="cl-override" data-name="${r.name}" ${r.overridden ? "checked" : ""} ${data.engineering_mode ? "" : "disabled"}> Override</label>`
+      : `<span class="muted small">locked</span>`;
+    row.innerHTML = `
+      <span class="cl-status ${r.status}">${label}</span>
+      <span>${r.name}</span>
+      <span class="cl-current">${r.current_value || "-"}</span>
+      <span class="cl-required">${r.required_value || "-"}</span>
+      <span>${overrideCell}</span>
+      <span class="cl-details">${r.reason || r.recommendation || ""}</span>`;
+    checklistRows.appendChild(row);
+  }
+  for (const cb of checklistRows.querySelectorAll(".cl-override")) {
+    cb.addEventListener("change", (e) => {
+      const ok = toggleOverride(e.target.dataset.name, e.target.checked);
+      if (!ok) e.target.checked = false;
+    });
+  }
+
+  clPassed.textContent = `Passed: ${counts.pass}`;
+  clFailed.textContent = `Failed: ${counts.fail}`;
+  clWarn.textContent = `Overridden/Warning: ${counts.warn}`;
+  clWaiting.textContent = `Waiting: ${counts.waiting}`;
+  clOverall.textContent = checklistReady ? "Vehicle Ready for Flight" : "NOT READY";
+  clOverall.classList.toggle("real", !checklistReady);
+}
 btnConnect.addEventListener("click", () => postJson("/api/connect", { uri: uriInput.value.trim() }));
 btnDisconnect.addEventListener("click", () => postJson("/api/disconnect", {}));
 
@@ -495,6 +581,13 @@ btnSetPiLinkUri.addEventListener("click", () => {
   const uri = piLinkUriInput.value.trim();
   if (uri && !confirm(`Route Pi commands through a SEPARATE connection (${uri}) instead of the vehicle link?`)) return;
   postJson("/api/pi_link/set_uri", { uri });
+});
+
+btnSetAlt.addEventListener("click", () => {
+  const alt = parseFloat(setAltInput.value);
+  if (isNaN(alt)) { alert("Enter a valid altitude in metres."); return; }
+  if (!confirm(`Change altitude to ${alt} m (position stays the same)?`)) return;
+  postJson("/api/camera/set_alt", { alt });
 });
 
 btnClickFly.addEventListener("click", () => { setClickModeUi("fly"); postJson("/api/camera/click_mode", { mode: "fly" }); });

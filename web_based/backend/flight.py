@@ -6,13 +6,49 @@ import config
 from geo import distance_m
 
 
-def set_mode(conn, mode: str) -> None:
+def set_mode(conn, mode: str, verify: bool = True, verify_timeout: float = 5.0) -> None:
     modes = conn.mode_mapping()
     if mode not in modes:
         raise RuntimeError(f"Mode '{mode}' not available on this vehicle: {list(modes)}")
-    conn.set_mode(modes[mode])
+    target_mode_id = modes[mode]
+    conn.set_mode(target_mode_id)
     print(f"[FLIGHT] Mode → {mode}")
-    time.sleep(1)
+
+    if not verify:
+        time.sleep(1)
+        return
+
+    # Fire-and-forget was the old behavior here -- if the FC rejects the
+    # request (e.g. "Mode change to AUTO failed: init failed"), the vehicle
+    # silently stays in its previous mode and nothing downstream would ever
+    # know, until something else (like a mission-progress watchdog) times
+    # out much later with a confusing unrelated-looking error. Checking the
+    # actual HEARTBEAT surfaces a rejection immediately and clearly instead.
+    #
+    # Also watches STATUSTEXT specifically: ArduPilot broadcasts the real
+    # reason as a STATUSTEXT ("Mode change to AUTO failed: init failed") --
+    # filtering to HEARTBEAT only (the old version of this) silently
+    # discards that message, leaving us with just a generic timeout and no
+    # way to know why.
+    deadline = time.time() + verify_timeout
+    rejection_text = None
+    while time.time() < deadline:
+        msg = conn.recv_match(type=["HEARTBEAT", "STATUSTEXT"], blocking=True, timeout=1)
+        if msg is None:
+            continue
+        if msg.get_type() == "HEARTBEAT" and msg.custom_mode == target_mode_id:
+            return
+        if msg.get_type() == "STATUSTEXT":
+            text = (msg.text or "").rstrip("\x00")
+            if "mode change" in text.lower() and mode.lower() in text.lower():
+                rejection_text = text   # keep the most recent match, in case of retries
+
+    if rejection_text:
+        raise RuntimeError(f"Mode change to {mode} was rejected by the flight controller: "
+                          f"\"{rejection_text}\"")
+    raise RuntimeError(f"Mode change to {mode} did not take effect within "
+                      f"{verify_timeout:.0f}s -- the flight controller likely rejected it "
+                      f"(check its own STATUSTEXT / Mission Planner message for the exact reason).")
 
 
 def set_param(conn, name: str, value: float) -> None:
@@ -20,6 +56,45 @@ def set_param(conn, name: str, value: float) -> None:
                             name.encode("ascii"), float(value),
                             mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
     print(f"[FLIGHT] Param {name} = {value}")
+
+
+def set_mission_current(conn, seq: int, verify: bool = True, verify_timeout: float = 5.0) -> None:
+    """Points the uploaded mission's 'current item' at a specific index,
+    without changing mode -- combine with set_mode(conn, 'AUTO') to have
+    the vehicle start flying from that exact item."""
+    conn.mav.command_long_send(conn.target_system, conn.target_component,
+                               mavutil.mavlink.MAV_CMD_DO_SET_MISSION_CURRENT,
+                               0, seq, 0, 0, 0, 0, 0, 0)
+    print(f"[FLIGHT] Mission current -> item {seq}")
+
+    if not verify:
+        return
+
+    # Verify via COMMAND_ACK, not MISSION_CURRENT -- the latter is a
+    # telemetry stream that may not broadcast promptly (or at all without
+    # an explicit stream-rate request), whereas COMMAND_ACK is sent
+    # immediately in direct response to this specific command.
+    deadline = time.time() + verify_timeout
+    while time.time() < deadline:
+        msg = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=1)
+        if msg is not None and msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MISSION_CURRENT:
+            if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                return
+            raise RuntimeError(f"Setting mission current to item {seq} was rejected "
+                              f"(MAV_RESULT={msg.result}).")
+    raise RuntimeError(f"Setting mission current to item {seq} was not acknowledged "
+                      f"within {verify_timeout:.0f}s.")
+
+
+def set_speed(conn, speed_ms: float, speed_type: int = 1) -> None:
+    """MAV_CMD_DO_CHANGE_SPEED -- changes GUIDED-mode flight speed in real
+    time, no parameter/reboot cycle needed (unlike WPNAV_SPEED). This is
+    what actually controls how fast fly_to() moves the vehicle.
+    speed_type: 0=airspeed, 1=groundspeed (use groundspeed for a copter)."""
+    print(f"[FLIGHT] Speed -> {speed_ms:.1f} m/s")
+    conn.mav.command_long_send(conn.target_system, conn.target_component,
+                               mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+                               0, speed_type, speed_ms, -1, 0, 0, 0, 0)
 
 
 def set_servo(conn, channel: int, pwm: int) -> None:
@@ -84,10 +159,16 @@ def takeoff(conn, alt: float = None) -> None:
     raise TimeoutError("Takeoff timeout — check ArduPilot pre-arm checks.")
 
 
+class FlightCancelled(Exception):
+    """Raised by fly_to() when a cancel_event is set mid-flight -- lets
+    callers distinguish 'deliberately cancelled' from a real timeout."""
+    pass
+
+
 def fly_to(conn, lat: float, lon: float, alt: float,
            radius: float = None, timeout: int = None,
            near_cb=None, near_threshold: float = 15.0,
-           position_cb=None) -> bool:
+           position_cb=None, cancel_event=None) -> bool:
     """Send SET_POSITION_TARGET in GUIDED mode and wait for arrival.
 
     near_cb(dist_m): called once, the first time distance-to-target drops
@@ -99,6 +180,11 @@ def fly_to(conn, lat: float, lon: float, alt: float,
         current position, whenever we happen to have a fresh one" (e.g.
         recomputing pin distances) without opening a second reader on the
         same connection.
+    cancel_event: a threading.Event checked every loop iteration (roughly
+        once a second). If set, raises FlightCancelled immediately instead
+        of waiting for this leg to finish on its own -- without this, a
+        "skip" button press wouldn't be noticed until whatever leg is
+        currently in progress completes, which can be tens of seconds.
     """
     radius  = radius  or config.WP_ACCEPT_RADIUS_M
     timeout = timeout or config.WAYPOINT_TIMEOUT
@@ -106,6 +192,9 @@ def fly_to(conn, lat: float, lon: float, alt: float,
     deadline, last_send = time.time() + timeout, 0
     near_fired = False
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            print("\n[FLIGHT] Cancelled mid-leg.")
+            raise FlightCancelled(f"fly_to to {lat:.7f},{lon:.7f} cancelled")
         if time.time() - last_send >= 1.0:
             conn.mav.set_position_target_global_int_send(
                 0, conn.target_system, conn.target_component,
@@ -153,9 +242,9 @@ def nudge_body(conn, forward_m: float, right_m: float, down_m: float = 0.0) -> N
 
 def localize_pixel_click(conn, px: float, py: float, frame_w: int, frame_h: int):
     """Reads the drone's current GPS + yaw and turns a clicked pixel into
-    an absolute GPS point. Returns (lat, lon) or None if GPS/attitude
-    aren't available yet. Shared by both click-to-fly and click-to-pin —
-    same math, different thing done with the result."""
+    an absolute GPS point. Returns (lat, lon, current_alt_agl) or None if
+    GPS/attitude aren't available yet. Shared by both click-to-fly and
+    click-to-pin — same math, different thing done with the result."""
     from geo import localize_click
     from connection import get_latest_position, get_latest_attitude
 
@@ -167,12 +256,22 @@ def localize_pixel_click(conn, px: float, py: float, frame_w: int, frame_h: int)
 
     lat = pos.lat / 1e7
     lon = pos.lon / 1e7
+    # get_latest_position() can non-deterministically return EITHER a
+    # GPS_RAW_INT or GLOBAL_POSITION_INT (whichever arrived last) -- only
+    # the latter has relative_alt. Ask for that one specifically rather
+    # than assume, same fix as the search-line code needed.
+    if pos.get_type() == "GLOBAL_POSITION_INT":
+        current_alt = pos.relative_alt / 1000.0
+    else:
+        gpi = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1)
+        current_alt = (gpi.relative_alt / 1000.0) if gpi is not None else config.MISSION_ALT
     yaw_deg = math.degrees(att.yaw)
     if yaw_deg < 0:
         yaw_deg += 360
 
-    return localize_click(lat, lon, yaw_deg, px, py, frame_w, frame_h,
-                          config.PIXELS_PER_METER_X, config.PIXELS_PER_METER_Y)
+    target_lat, target_lon = localize_click(lat, lon, yaw_deg, px, py, frame_w, frame_h,
+                                            config.PIXELS_PER_METER_X, config.PIXELS_PER_METER_Y)
+    return target_lat, target_lon, current_alt
 
 
 def fly_to_clicked_point(conn, px: float, py: float, frame_w: int, frame_h: int,
@@ -182,13 +281,20 @@ def fly_to_clicked_point(conn, px: float, py: float, frame_w: int, frame_h: int,
     Turns the clicked pixel into an absolute GPS point (localize_pixel_click)
     and flies straight there with fly_to(). Unlike nudge_body() (a relative
     body-frame offset), this computes one real target coordinate per click.
+
+    Moves in the XY plane ONLY by default -- altitude stays at whatever
+    the drone is currently flying at, it does NOT snap back to a fixed
+    MISSION_ALT. Pass an explicit alt= if you actually want to change
+    height as part of this click (the separate altitude field is the
+    normal way to do that instead).
     """
     result = localize_pixel_click(conn, px, py, frame_w, frame_h)
     if result is None:
         return False
-    target_lat, target_lon = result
-    target_alt = alt if alt is not None else config.MISSION_ALT
-    print(f"[FLIGHT] Click localized → {target_lat:.7f}, {target_lon:.7f}")
+    target_lat, target_lon, current_alt = result
+    target_alt = alt if alt is not None else current_alt
+    print(f"[FLIGHT] Click localized → {target_lat:.7f}, {target_lon:.7f}  "
+         f"alt={target_alt:.1f}m ({'explicit' if alt is not None else 'unchanged'})")
     return fly_to(conn, target_lat, target_lon, target_alt)
 
 
