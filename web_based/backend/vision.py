@@ -1,12 +1,9 @@
 """Camera feed + AI detection for the search-area phase.
 
-Simulation (TEST_FLAG=1):
-    Local webcam, no AI — just enough to test the click-to-fly workflow
-    on the bench without a real video/companion link.
-
-Real drone (TEST_FLAG=0):
-    RTSP feed (config.RTSP_URL) + YOLOv11s (config.AI_MODEL_PATH) looking
-    for tents / mannequins, boxes drawn live on the feed.
+AI detection (config.AI_MODEL_PATH) now runs regardless of camera mode --
+webcam or RTSP both get it, as long as ultralytics is installed and the
+model file loads. Falls back to feed-only (no detection) if either isn't
+available, rather than failing the whole camera feed.
 
 This module only produces frames + detections. The GUI is responsible for
 drawing them and for turning clicks into flight.nudge_body() calls.
@@ -53,19 +50,16 @@ class CameraWorker:
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera source: {source}")
 
-        if self.use_rtsp:
-            if YOLO is None:
-                print("[VISION] ultralytics not installed — feed only, no AI detection.")
-            else:
-                try:
-                    print(f"[VISION] Loading AI model {config.AI_MODEL_PATH} ...")
-                    self._model = YOLO(config.AI_MODEL_PATH)
-                    print("[VISION] AI model ready ✓")
-                except Exception as e:
-                    print(f"[VISION] AI model unavailable ({e}) — continuing with feed only, no AI detection.")
-                    self._model = None
+        if YOLO is None:
+            print("[VISION] ultralytics not installed — feed only, no AI detection.")
         else:
-            print("[VISION] Webcam mode — AI disabled (set config.CAMERA_MODE='rtsp' to enable).")
+            try:
+                print(f"[VISION] Loading AI model {config.AI_MODEL_PATH} ...")
+                self._model = YOLO(config.AI_MODEL_PATH)
+                print("[VISION] AI model ready ✓")
+            except Exception as e:
+                print(f"[VISION] AI model unavailable ({e}) — continuing with feed only, no AI detection.")
+                self._model = None
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)

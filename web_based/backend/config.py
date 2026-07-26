@@ -31,7 +31,7 @@ HOME_LON     = None
 HOME_ALT_MSL = None
 
 # ----- Altitudes (AGL metres) ----------------------------------
-MISSION_ALT  = 18
+MISSION_ALT  = 5
 
 # ----- Mission behaviour ---------------------------------------
 DEFAULT_LAPS             = 1
@@ -92,7 +92,10 @@ CAMERA_MODE = "webcam"
 
 WEBCAM_INDEX   = 0
 RTSP_URL       = "rtsp://192.168.144.25:8554/main.264"   # TODO: set to your VTX/companion RTSP URL
-AI_MODEL_PATH  = "best.pt"     # trained YOLOv11s weights from the Colab pipeline
+AI_MODEL_PATH  = "yolo11n.pt"  # extra-large variant -- most accurate, but noticeably heavier
+                               # per-frame than the nano model, especially on CPU. If the
+                               # detection boxes start visibly lagging behind the live feed,
+                               # raise AI_INFER_EVERY_N below rather than switching back down.
 AI_CONF_THRESH = 0.4
 AI_INFER_EVERY_N = 3           # run the model every Nth frame (perf)
 
