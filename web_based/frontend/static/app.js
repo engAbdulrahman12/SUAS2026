@@ -286,6 +286,14 @@ $("btnClearPiLog").addEventListener("click", () => (piLogBox.innerHTML = ""));
 // ══════════════════════════════════════════════════════════════
 let rowSeq = 0;
 const wpRows = $("wpRows");
+const missionAltInput = $("missionAltInput");
+wpRows.addEventListener("input", (e) => {
+  if (!e.target.classList.contains("f-alt")) return;
+  if (e.target !== wpRows.children[0]?.querySelector(".f-alt")) return;   // only the first row suggests
+  if (missionAltInput.value.trim() !== "") return;   // never overwrite an operator-entered value
+  const v = e.target.value.trim();
+  if (v !== "" && !Number.isNaN(parseFloat(v))) missionAltInput.value = v;
+});
 
 function addRow(lat = "", lon = "", alt = "", name = "") {
   rowSeq += 1;
@@ -330,6 +338,9 @@ $("jsonFile").addEventListener("change", (e) => {
       if (data.default_laps) { laps = parseInt(data.default_laps, 10); lapsVal.textContent = laps; }
       wpRows.innerHTML = "";
       for (const wp of wps) addRow(wp.lat ?? "", wp.lon ?? "", wp.alt ?? "", wp.name ?? "");
+      if (missionAltInput.value.trim() === "" && wps[0]?.alt != null) {
+        missionAltInput.value = wps[0].alt;
+      }
       const corners = data.search_corners;
       if (corners && corners.length === 4) {
         ["A", "B", "C", "D"].forEach((tag, i) => {
@@ -417,8 +428,12 @@ btnStart.addEventListener("click", () => {
   if (corners === "ERR") { alert("Fill all 4 search corners (lat/lon) or leave all blank."); return; }
 
   const modeTxt = state.sim ? "SIMULATION" : "REAL DRONE";
+  const missionAltRaw = missionAltInput.value.trim();
+  const missionAlt = missionAltRaw === "" ? null : parseFloat(missionAltRaw);
+  if (missionAltRaw !== "" && Number.isNaN(missionAlt)) { alert("Mission Alt must be a valid number."); return; }
   let confirmMsg =
     `Mode      : ${modeTxt}\nWaypoints : ${pts.length}\nLaps      : ${laps}\n` +
+    `Mission Alt: ${missionAlt != null ? missionAlt + " m" : "(default)"}\n` +
     `Search    : ${corners ? "4-corner area" : "SKIPPED"}\nURI       : ${uriInput.value.trim()}`;
   const activeOverrides = lastChecklistData
     ? lastChecklistData.results.filter((r) => r.overridden).map((r) => r.name)
@@ -429,18 +444,19 @@ btnStart.addEventListener("click", () => {
   }
   $("confirmText").textContent = confirmMsg;
   $("confirmModal").style.display = "flex";
-  $("confirmModal")._payload = { pts, corners, uri: uriInput.value.trim() };
+  $("confirmModal")._payload = { pts, corners, uri: uriInput.value.trim(), missionAlt };
 });
 
 $("btnConfirmCancel").addEventListener("click", () => ($("confirmModal").style.display = "none"));
 $("btnConfirmGo").addEventListener("click", () => {
-  const { pts, corners, uri } = $("confirmModal")._payload;
+  const { pts, corners, uri, missionAlt } = $("confirmModal")._payload;
   $("confirmModal").style.display = "none";
   postJson("/api/mission/start", {
     waypoints: pts.map((p) => ({ lat: p.lat, lon: p.lon, alt: p.alt ?? defaultAlt() })),
     laps,
     uri,
     search_corners: corners ? corners.map((c) => ({ lat: c.lat, lon: c.lon, alt: c.alt ?? defaultAlt() })) : null,
+    mission_alt: missionAlt,
   });
 });
 

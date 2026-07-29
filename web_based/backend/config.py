@@ -71,8 +71,19 @@ LAP_ACCEPT_RADIUS_M      = 30.0   # GUIDED lap flying ONLY -- looser on purpose:
 MAX_DISTANCE_FROM_HOME_M = 500.0
 
 # ----- GPS readiness -------------------------------------------
-MIN_GPS_FIX_TYPE = 0
-MIN_SATELLITES   = 0
+# Was 0/0 (accepts ANY reading, including fix=1/NO_FIX with 0 satellites)
+# -- this let a transient garbage reading during normal GPS lock-on get
+# captured as the home/takeoff reference on a real flight. SITL's
+# simulated GPS reports a good fix almost instantly, so this never
+# surfaced there -- real receivers take real time to lock, and these
+# thresholds exist specifically to wait through that window rather than
+# grab the first thing that arrives. Matches CHECKLIST_CONFIG's own
+# min_satellites below, so both paths agree on what "ready" means.
+MIN_GPS_FIX_TYPE = 3     # 3 = 3D fix (GPS_FIX_TYPE enum)
+MIN_SATELLITES   = 3
+GPS_STABLE_WINDOW_S = 2.0   # good reading must hold continuously this long before being
+                            # trusted -- guards against a single spurious sample that
+                            # momentarily clears the threshold then reverts
 
 # ----- Timeouts (seconds) --------------------------------------
 HEARTBEAT_TIMEOUT = 10
@@ -92,7 +103,7 @@ CAMERA_MODE = "webcam"
 
 WEBCAM_INDEX   = 0
 RTSP_URL       = "rtsp://192.168.144.25:8554/main.264"   # TODO: set to your VTX/companion RTSP URL
-AI_MODEL_PATH  = "yolo11n.pt"  # extra-large variant -- most accurate, but noticeably heavier
+AI_MODEL_PATH  = "yolo11x.pt"  # extra-large variant -- most accurate, but noticeably heavier
                                # per-frame than the nano model, especially on CPU. If the
                                # detection boxes start visibly lagging behind the live feed,
                                # raise AI_INFER_EVERY_N below rather than switching back down.

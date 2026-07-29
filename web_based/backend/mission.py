@@ -43,8 +43,16 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                 laps: int,
                 home_lat: float = None,
                 home_lon: float = None,
-                search_corners: list[tuple[float, float, float]] = None) -> list[dict]:
+                search_corners: list[tuple[float, float, float]] = None,
+                mission_alt: float = None) -> list[dict]:
     """Build the ordered list of mission item dicts.
+
+    mission_alt: takeoff altitude and fallback for waypoints/search corners
+                 that don't specify their own -- pass the website's
+                 per-mission value here rather than relying on the
+                 config.MISSION_ALT constant, since the right altitude
+                 varies by flying site and shouldn't require a code edit
+                 each time. Falls back to config.MISSION_ALT if not given.
 
     Returns (items, first_lap_idx, after_laps_idx) -- the latter two let
     the caller run the lap sequence in AUTO mode and know exactly which
@@ -69,6 +77,7 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
     home_lat = home_lat if home_lat is not None else takeoff_lat
     home_lon = home_lon if home_lon is not None else takeoff_lon
     home_alt = config.HOME_ALT_MSL if config.HOME_ALT_MSL is not None else 0.0
+    mission_alt = mission_alt if mission_alt is not None else config.MISSION_ALT
 
     items = []
 
@@ -77,16 +86,16 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
                           cmd=16, frame=_MSL, current=0, p2=0))
 
     # Item 1 — TAKEOFF
-    items.append(_make_wp(1, takeoff_lat, takeoff_lon, config.MISSION_ALT,
+    items.append(_make_wp(1, takeoff_lat, takeoff_lon, mission_alt,
                           cmd=22, frame=_REL, current=1, p2=0))
 
     # Lap waypoints (with per-waypoint altitude + alt-change inserts)
     first_lap_idx = len(items)
     for _ in range(laps):
-        prev_alt = config.MISSION_ALT
+        prev_alt = mission_alt
         for wp in waypoints:
             lat, lon = wp[0], wp[1]
-            alt = wp[2] if len(wp) > 2 else config.MISSION_ALT
+            alt = wp[2] if len(wp) > 2 else mission_alt
 
             if abs(alt - prev_alt) > 0.5:
                 # Insert altitude-adjustment point: same position, new altitude
@@ -98,14 +107,14 @@ def build_items(takeoff_lat: float, takeoff_lon: float,
     # Mapping-pass preview points (visual verification only — see docstring)
     if search_corners and len(search_corners) == 4:
         corners_latlon = [(c[0], c[1]) for c in search_corners]
-        pass_alt = search_corners[0][2] if len(search_corners[0]) > 2 else config.MISSION_ALT
+        pass_alt = search_corners[0][2] if len(search_corners[0]) > 2 else mission_alt
         pass_points = build_straight_line_path(corners_latlon, alt=pass_alt)
         for lat, lon, alt in pass_points:
             items.append(_make_wp(len(items), lat, lon, alt))
 
     # RTL
     items.append(_make_wp(len(items), home_lat, home_lon,
-                          config.MISSION_ALT, cmd=20, p2=0))
+                          mission_alt, cmd=20, p2=0))
 
     # Renumber
     for i, it in enumerate(items):

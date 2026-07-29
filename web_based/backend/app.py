@@ -174,6 +174,7 @@ class MissionStartBody(BaseModel):
     laps: int
     uri: str
     search_corners: list[SearchCorner] | None = None
+    mission_alt: float | None = None
 
 
 @app.post("/api/mission/start")
@@ -181,7 +182,8 @@ async def mission_start(body: MissionStartBody):
     wps = [(w.lat, w.lon, w.alt) for w in body.waypoints]
     corners = ([(c.lat, c.lon, c.alt) for c in body.search_corners]
                if body.search_corners else None)
-    params = MissionParams(waypoints=wps, laps=body.laps, uri=body.uri, search_corners=corners)
+    params = MissionParams(waypoints=wps, laps=body.laps, uri=body.uri,
+                           search_corners=corners, mission_alt=body.mission_alt)
     ctl.start_mission(params)
     return {"ok": True}
 

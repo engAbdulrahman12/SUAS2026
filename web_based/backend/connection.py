@@ -67,17 +67,29 @@ def connect(uri: str | None = None, baud: int | None = None) -> mavutil.mavfile:
     return conn
 
 
-def wait_gps(conn, simulation: bool = False, timeout: int = None) -> tuple[float, float]:
+def wait_gps(conn, simulation: bool = False, timeout: int = None) -> tuple[float, float, float]:
     """Block until a valid GPS fix is available.
 
     Waits for GLOBAL_POSITION_INT with a non-zero position.
     Uses GPS_RAW_INT for fix/satellite quality checks when available.
     Position 0,0 is always rejected — it means no fix yet.
+
+    Requires the good reading to hold steady for config.GPS_STABLE_WINDOW_S
+    continuous seconds before trusting it -- accepting the very first
+    sample that clears the threshold (the old behavior) is vulnerable to
+    a single spurious reading (a momentary multipath glitch, a transient
+    bad calculation) that happens to look good for one sample before
+    reverting. Any sample that drops back below threshold resets the
+    stability clock, so only a genuinely settled fix gets returned.
+
+    Returns (lat, lon, alt_msl) -- altitude comes from the SAME validated
+    GLOBAL_POSITION_INT read as lat/lon, not a separate unguarded read.
     """
     timeout  = timeout or config.GPS_TIMEOUT
     deadline = time.time() + timeout
     last_gps = None   # GPS_RAW_INT
     last_pos = None   # GLOBAL_POSITION_INT
+    good_since = None   # timestamp the CURRENT unbroken good streak started, or None
 
     print("[GPS] Waiting for position fix...")
     while time.time() < deadline:
@@ -106,35 +118,52 @@ def wait_gps(conn, simulation: bool = False, timeout: int = None) -> tuple[float
                 elif t == "GLOBAL_POSITION_INT":
                     last_pos = msg
 
-        # SITL: accept any position immediately
+        # SITL: accept any position immediately -- no stability window here,
+        # simulated GPS doesn't glitch the way real hardware can.
         if last_pos and simulation:
             print("[GPS] Simulation position ready ✓")
-            return last_pos.lat / 1e7, last_pos.lon / 1e7
+            return last_pos.lat / 1e7, last_pos.lon / 1e7, last_pos.alt / 1000.0
 
         if last_pos:
             lat = last_pos.lat / 1e7
             lon = last_pos.lon / 1e7
+            alt_msl = last_pos.alt / 1000.0
             has_pos = abs(lat) > 0.001 or abs(lon) > 0.001
 
             if last_gps:
                 fix  = last_gps.fix_type
                 sats = getattr(last_gps, "satellites_visible", 0)
-                print(f"[GPS] fix={fix}  sats={sats}  pos={lat:.5f},{lon:.5f}  "
-                      f"need fix>={config.MIN_GPS_FIX_TYPE} sats>={config.MIN_SATELLITES}   ",
-                      end="\r")
-                # Accept only when position is real AND thresholds met
-                if has_pos and fix >= config.MIN_GPS_FIX_TYPE and sats >= config.MIN_SATELLITES:
-                    print(f"\n[GPS] Fix ready  fix={fix}  sats={sats} ✓")
-                    return lat, lon
+                currently_good = has_pos and fix >= config.MIN_GPS_FIX_TYPE and sats >= config.MIN_SATELLITES
+
+                if currently_good:
+                    if good_since is None:
+                        good_since = time.time()
+                    held_for = time.time() - good_since
+                    print(f"[GPS] fix={fix}  sats={sats}  pos={lat:.5f},{lon:.5f}  "
+                          f"holding {held_for:.1f}/{config.GPS_STABLE_WINDOW_S:.1f}s   ",
+                          end="\r")
+                    if held_for >= config.GPS_STABLE_WINDOW_S:
+                        print(f"\n[GPS] Fix ready  fix={fix}  sats={sats}  alt={alt_msl:.1f}m MSL  "
+                             f"(stable {held_for:.1f}s) ✓")
+                        return lat, lon, alt_msl
+                else:
+                    if good_since is not None:
+                        print(f"\n[GPS] Reading dropped below threshold -- resetting stability timer.")
+                    good_since = None   # broken streak -- any dip starts the clock over
+                    print(f"[GPS] fix={fix}  sats={sats}  pos={lat:.5f},{lon:.5f}  "
+                          f"need fix>={config.MIN_GPS_FIX_TYPE} sats>={config.MIN_SATELLITES}   ",
+                          end="\r")
             else:
+                good_since = None
                 if not has_pos:
                     print("[GPS] pos=0,0 — waiting for real GPS fix...   ", end="\r")
                 elif config.MIN_GPS_FIX_TYPE == 0 and config.MIN_SATELLITES == 0:
                     print(f"\n[GPS] Position ready ({lat:.6f}, {lon:.6f}) ✓")
-                    return lat, lon
+                    return lat, lon, alt_msl
                 else:
                     print("[GPS] Have position, waiting for GPS_RAW_INT...   ", end="\r")
         else:
+            good_since = None
             print("[GPS] No GLOBAL_POSITION_INT yet...   ", end="\r")
 
         time.sleep(0.1)

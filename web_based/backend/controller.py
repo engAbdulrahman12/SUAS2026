@@ -75,6 +75,8 @@ class MissionParams:
     laps: int
     uri: str
     search_corners: object   # [(lat,lon,alt) x4] or None to skip
+    mission_alt: float = None   # takeoff/RTL/fallback altitude for THIS mission --
+                                # None falls back to config.MISSION_ALT
 
 
 class MissionController:
@@ -102,6 +104,7 @@ class MissionController:
         # object pins (click-to-pin) + route planning
         self.pins = []               # [{id, name, lat, lon, distance_m}, ...]
         self.mapping_exit_point = None   # (lat, lon) -- where the mapping pass ended
+        self.mission_alt = config.MISSION_ALT   # overridden per-mission in start_mission()
         self.home_point = None           # (lat, lon) -- RTL destination for this mission
 
         # dedicated read-only connection for incoming Pi STATUSTEXT messages
@@ -1006,7 +1009,7 @@ class MissionController:
         from flight import fly_to
         self._log(f"[PIN] Flying to {pin['name']} @ {pin['lat']:.7f},{pin['lon']:.7f}", "info")
         threading.Thread(target=fly_to,
-                         args=(self.conn, pin["lat"], pin["lon"], config.MISSION_ALT),
+                         args=(self.conn, pin["lat"], pin["lon"], self.mission_alt),
                          daemon=True).start()
 
     def fly_route(self, order: list):
@@ -1021,7 +1024,7 @@ class MissionController:
                 if pin is None:
                     continue
                 self._log(f"[ROUTE] → {pin['name']}", "info")
-                fly_to(self.conn, pin["lat"], pin["lon"], config.MISSION_ALT)
+                fly_to(self.conn, pin["lat"], pin["lon"], self.mission_alt)
             self._log("[ROUTE] Route complete. Use RTL/Abort to return home.", "ok")
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1064,6 +1067,13 @@ class MissionController:
         self.guided_backup_event.clear()
         self.fly_mode_unlocked = False
         self.click_mode = "pin"
+        # This mission's altitude -- explicit override from the website if
+        # given, otherwise the config fallback. Stored on self so pin-flying
+        # (fly_to_pin/fly_route, called independently of _run()) uses the
+        # SAME value as the rest of this mission, not a stale config constant.
+        params.mission_alt = params.mission_alt if params.mission_alt is not None else config.MISSION_ALT
+        self.mission_alt = params.mission_alt
+        self._log(f"[MAIN] Mission altitude: {self.mission_alt:.1f} m AGL", "info")
         with self.lock:
             self.state["mission_running"] = True
             self.state["click_mode"] = "pin"
@@ -1085,7 +1095,8 @@ class MissionController:
             p0 = params.waypoints[0]
             items, _, _ = build_items(p0[0], p0[1], params.waypoints, params.laps,
                                       home_lat=p0[0], home_lon=p0[1],
-                                      search_corners=params.search_corners)
+                                      search_corners=params.search_corners,
+                                      mission_alt=params.mission_alt)
             save_waypoints_file(items)
             self._log(f"✓ {WP_FILE} saved — load in MP PLAN tab to verify.", "ok")
             self._log("After verifying waypoints in Mission Planner, click Continue →", "info")
@@ -1114,9 +1125,7 @@ class MissionController:
             with self.lock:
                 self.state["conn_active"] = True
             self._push_state()
-            take_lat, take_lon = wait_gps(conn, simulation=bool(cfg.TEST_FLAG))
-            msg = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
-            alt_msl = (msg.alt / 1000.0) if msg else 0.0
+            take_lat, take_lon, alt_msl = wait_gps(conn, simulation=bool(cfg.TEST_FLAG))
             home_lat = cfg.HOME_LAT or take_lat
             home_lon = cfg.HOME_LON or take_lon
             home_alt = cfg.HOME_ALT_MSL or alt_msl
@@ -1127,7 +1136,8 @@ class MissionController:
             items, first_lap_idx, after_laps_idx = build_items(
                 take_lat, take_lon, params.waypoints, params.laps,
                 home_lat=home_lat, home_lon=home_lon,
-                search_corners=params.search_corners)
+                search_corners=params.search_corners,
+                mission_alt=params.mission_alt)
             save_waypoints_file(items)
 
             # Pre-flight safety checklist gate. Telemetry only starts
@@ -1156,7 +1166,7 @@ class MissionController:
                 self.state["armed"] = True
             self._push_state()
             self._set_status("Flying", "ok")
-            takeoff(conn, cfg.MISSION_ALT)
+            takeoff(conn, params.mission_alt)
             set_fixed_home(conn, home_lat, home_lon, home_alt)
 
             # Mission is NOT uploaded automatically anymore, and the website
@@ -1167,7 +1177,7 @@ class MissionController:
             # human watching Mission Planner's own UI sees the real
             # rejection reason instantly, instead of us guessing blind
             # through relayed log text.
-            set_param(conn, "RTL_ALT", cfg.MISSION_ALT * 100)
+            set_param(conn, "RTL_ALT", params.mission_alt * 100)
             self._log(f"[MISSION] {len(items)}-item mission file saved locally -- "
                      f"upload it via Mission Planner (remember to Set Current WP to "
                      f"your first lap waypoint) when ready.", "info")
@@ -1208,7 +1218,7 @@ class MissionController:
                 try:
                     for lap in range(1, params.laps + 1):
                         self._log(f"[MAIN] — Lap {lap}/{params.laps} (GUIDED) —", "info")
-                        prev = cfg.MISSION_ALT
+                        prev = params.mission_alt
                         for i, wp in enumerate(params.waypoints, 1):
                             # Checked BETWEEN waypoints, not mid-flight --
                             # lets whichever leg is currently in progress
