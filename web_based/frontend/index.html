@@ -68,6 +68,9 @@
       <div class="rail-item" id="railPi" title="Pi status listener link">
         <span class="rail-dot"></span><span class="rail-label">Pi Link</span>
       </div>
+      <div class="rail-item" id="railLapCounter" style="display:none;" title="Live lap progress and estimated Flight Endurance score (200 x (completed_laps/10)^2, per the team's own scoring formula)">
+        <span class="rail-label" id="lapCounterText" style="color:var(--acc-green,#4ade80);font-weight:600;"></span>
+      </div>
     </div>
   </div>
 
@@ -294,6 +297,7 @@
     <button id="btnAbort" class="btn btn-danger btn-abort" disabled>⚠ RTL / ABORT</button>
     <button id="btnSkipLaps" class="btn btn-mini" disabled title="Ends the remaining laps early and heads straight to the search/mapping line">Skip to Search Line</button>
     <button id="btnGuidedBackup" class="btn btn-mini" disabled title="Safety backup: fly the laps in GUIDED per-waypoint instead of waiting for/using AUTO">Start as Guided Mode</button>
+    <button id="btnMute" class="btn btn-mini" title="Website sends NO further commands while muted (except Abort/RTL, which always works). Resume any time with Unmute.">🔇 Mute Website Control</button>
     <span id="statusLbl" class="status-lbl">Ready</span>
     <div class="footbar-right">
       <button id="btnContinue" class="btn btn-primary" style="display:none">Continue →</button>
@@ -309,6 +313,20 @@
       <div class="modal-actions">
         <button id="btnGoHome" class="btn btn-neutral">Return Home (RTL)</button>
         <button id="btnGoSearch" class="btn btn-primary">Go to Search Area</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUTO stopped -- explicit operator decision, never automatic -->
+  <div id="autoStoppedModal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <h3>AUTO mode stopped — what would you like to do?</h3>
+      <p class="muted small">The website can't tell whether this was deliberate (Abort, an RC mode
+        change) or a genuine problem, so it isn't guessing — you decide.</p>
+      <p id="autoStoppedReason" class="mono small" style="margin:8px 0;"></p>
+      <div class="modal-actions">
+        <button id="btnAutoStoppedContinue" class="btn btn-neutral">Continue anyway (I'll handle it manually)</button>
+        <button id="btnAutoStoppedGuided" class="btn btn-primary">Switch to GUIDED — continue laps</button>
       </div>
     </div>
   </div>

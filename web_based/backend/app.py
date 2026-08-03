@@ -204,6 +204,16 @@ async def mission_post_lap(body: PostLapBody):
     return {"ok": True}
 
 
+class AutoStoppedBody(BaseModel):
+    choice: str   # "guided" | "continue"
+
+
+@app.post("/api/mission/auto_stopped_choice")
+async def mission_auto_stopped(body: AutoStoppedBody):
+    ctl.choose_auto_stopped(body.choice)
+    return {"ok": True}
+
+
 @app.post("/api/mission/skip_to_search")
 async def skip_to_search():
     ctl.skip_to_search()
@@ -213,6 +223,18 @@ async def skip_to_search():
 @app.post("/api/mission/start_guided_backup")
 async def start_guided_backup():
     ctl.start_guided_backup()
+    return {"ok": True}
+
+
+@app.post("/api/mission/mute")
+async def mission_mute():
+    ctl.mute_control()
+    return {"ok": True}
+
+
+@app.post("/api/mission/unmute")
+async def mission_unmute():
+    ctl.unmute_control()
     return {"ok": True}
 
 

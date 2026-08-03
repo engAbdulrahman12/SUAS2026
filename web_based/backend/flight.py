@@ -168,7 +168,7 @@ class FlightCancelled(Exception):
 def fly_to(conn, lat: float, lon: float, alt: float,
            radius: float = None, timeout: int = None,
            near_cb=None, near_threshold: float = 15.0,
-           position_cb=None, cancel_event=None) -> bool:
+           position_cb=None, cancel_event=None, mute_event=None) -> bool:
     """Send SET_POSITION_TARGET in GUIDED mode and wait for arrival.
 
     near_cb(dist_m): called once, the first time distance-to-target drops
@@ -182,19 +182,38 @@ def fly_to(conn, lat: float, lon: float, alt: float,
         same connection.
     cancel_event: a threading.Event checked every loop iteration (roughly
         once a second). If set, raises FlightCancelled immediately instead
-        of waiting for this leg to finish on its own -- without this, a
-        "skip" button press wouldn't be noticed until whatever leg is
-        currently in progress completes, which can be tens of seconds.
+    mute_event: a threading.Event checked every loop iteration. While set,
+        this leg is fully paused: no new position-target is sent (so the
+        website stops re-asserting its old target once a second, which
+        would otherwise fight an operator's manual control in Mission
+        Planner even while "muted"), and the leg's own timeout clock is
+        held rather than continuing to run out during the pause. Resumes
+        exactly where it left off once cleared -- the leg is not restarted.
     """
     radius  = radius  or config.WP_ACCEPT_RADIUS_M
     timeout = timeout or config.WAYPOINT_TIMEOUT
     print(f"[FLIGHT] → {lat:.7f}, {lon:.7f}  alt={alt:.1f} m")
     deadline, last_send = time.time() + timeout, 0
     near_fired = False
+    was_muted = False
     while time.time() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             print("\n[FLIGHT] Cancelled mid-leg.")
             raise FlightCancelled(f"fly_to to {lat:.7f},{lon:.7f} cancelled")
+
+        if mute_event is not None and mute_event.is_set():
+            if not was_muted:
+                print("\n[FLIGHT] Muted -- pausing, not sending further commands "
+                     "until unmuted.")
+                was_muted = True
+            deadline += 0.5   # hold the timeout clock during the pause
+            time.sleep(0.5)
+            continue
+        if was_muted:
+            print("[FLIGHT] Unmuted -- resuming this leg.")
+            was_muted = False
+            last_send = 0   # force an immediate re-send on resume
+
         if time.time() - last_send >= 1.0:
             conn.mav.set_position_target_global_int_send(
                 0, conn.target_system, conn.target_component,
@@ -287,7 +306,17 @@ def fly_to_clicked_point(conn, px: float, py: float, frame_w: int, frame_h: int,
     MISSION_ALT. Pass an explicit alt= if you actually want to change
     height as part of this click (the separate altitude field is the
     normal way to do that instead).
+
+    Always uses full speed with yaw-face-waypoint disabled -- regardless
+    of whatever phase came before this click. Without this, a click-to-fly
+    after the search/mapping pass would silently inherit that pass's slow
+    speed and yaw-facing behavior, since neither gets reset automatically
+    once the pass ends.
     """
+    set_param(conn, "WP_YAW_BEHAVIOR", config.WP_YAW_BEHAVIOR_LAPS)
+    set_param(conn, "WP_SPD", config.LAP_SPEED_MS)
+    set_speed(conn, config.LAP_SPEED_MS)
+
     result = localize_pixel_click(conn, px, py, frame_w, frame_h)
     if result is None:
         return False
@@ -301,7 +330,17 @@ def fly_to_clicked_point(conn, px: float, py: float, frame_w: int, frame_h: int,
 def rtl_and_land(conn, home_lat=None, home_lon=None) -> None:
     """Switch to RTL mode and wait until the drone lands.
     home_lat/home_lon optional — used only for distance display.
+
+    Forces full speed with yaw-face-waypoint disabled before RTL --
+    WP_YAW_BEHAVIOR explicitly governs RTL yaw too (per its own ArduPilot
+    description), so if the search/mapping pass left it at face-next-
+    waypoint + 5 m/s, RTL would silently inherit that slow, yaw-facing
+    behavior instead of returning home directly at full speed.
     """
+    set_param(conn, "WP_YAW_BEHAVIOR", config.WP_YAW_BEHAVIOR_LAPS)
+    set_param(conn, "WP_SPD", config.LAP_SPEED_MS)
+    set_speed(conn, config.LAP_SPEED_MS)
+
     print("[FLIGHT] RTL → home")
     set_mode(conn, "RTL")
     deadline = time.time() + config.RTL_TIMEOUT

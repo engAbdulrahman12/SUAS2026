@@ -38,9 +38,10 @@ DEFAULT_LAPS             = 1
 
 # ----- Speed + yaw behavior, laps vs. search/mapping pass -------
 # LAP_SPEED_MS: set this to your vehicle's actual configured max cruise
-# speed (matching whatever WPNAV_SPEED is tuned to on the flight
-# controller, converted to m/s) -- this can't be safely guessed here,
-# it depends entirely on your specific vehicle's tuning.
+# speed (matching whatever WP_SPD is tuned to on the flight controller --
+# confirmed as the actual current parameter name/units on your firmware,
+# already in m/s directly, no conversion needed) -- this can't be safely
+# guessed here, it depends entirely on your specific vehicle's tuning.
 LAP_SPEED_MS    = 12.0    # CHANGE THIS to your vehicle's real max speed
 SEARCH_SPEED_MS = 5.0     # slower, deliberate speed for stable mapping video
 
@@ -80,7 +81,7 @@ MAX_DISTANCE_FROM_HOME_M = 500.0
 # grab the first thing that arrives. Matches CHECKLIST_CONFIG's own
 # min_satellites below, so both paths agree on what "ready" means.
 MIN_GPS_FIX_TYPE = 3     # 3 = 3D fix (GPS_FIX_TYPE enum)
-MIN_SATELLITES   = 3
+MIN_SATELLITES   = 10
 GPS_STABLE_WINDOW_S = 2.0   # good reading must hold continuously this long before being
                             # trusted -- guards against a single spurious sample that
                             # momentarily clears the threshold then reverts

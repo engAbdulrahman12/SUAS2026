@@ -9,6 +9,8 @@ let wsReconnectTimer = null;
 let state = {
   sim: true, mav_running: false, mission_running: false,
   awaiting_continue: false, awaiting_post_lap: false, search_available: false,
+  awaiting_auto_stopped: false, auto_stopped_reason: "",
+  auto_lap_current: 0, auto_lap_total: 0, auto_lap_points: 0,
   click_to_fly_enabled: false, status_text: "Ready", status_level: "info", armed: false,
   conn_active: false,
 };
@@ -47,6 +49,7 @@ const piLinkRow = $("piLinkRow"), piLinkHint = $("piLinkHint");
 const btnAbort = $("btnAbort"), btnStart = $("btnStart"), btnContinue = $("btnContinue");
 const btnSkipLaps = $("btnSkipLaps");
 const btnGuidedBackup = $("btnGuidedBackup");
+const btnMute = $("btnMute");
 const statusLbl = $("statusLbl");
 const camImg = $("camImg"), camPlaceholder = $("camPlaceholder"), camInfo = $("camInfo");
 const btnCamWebcam = $("btnCamWebcam"), btnCamRtsp = $("btnCamRtsp"), camSourceInput = $("camSourceInput"),
@@ -156,6 +159,8 @@ function applyState(s) {
   btnAbort.disabled = !(state.armed || state.mission_running);
   btnSkipLaps.disabled = !state.mission_running;
   btnGuidedBackup.disabled = !state.mission_running;
+  btnMute.textContent = state.muted ? "🔊 Unmute Website Control" : "🔇 Mute Website Control";
+  btnMute.classList.toggle("btn-danger", !!state.muted);
   btnStart.disabled = state.mission_running || (state.conn_active && !checklistReady);
   btnContinue.style.display = state.awaiting_continue ? "inline-block" : "none";
   mavStatus.textContent = state.mav_running ? `Running on ${state.mav_port || ""}` : "Stopped";
@@ -181,6 +186,16 @@ function applyState(s) {
   }
 
   if (state.awaiting_post_lap) showPostLapModal(state.search_available);
+  if (state.awaiting_auto_stopped) showAutoStoppedModal(state.auto_stopped_reason);
+
+  const railLapCounter = $("railLapCounter");
+  if (state.auto_lap_total > 0) {
+    railLapCounter.style.display = "";
+    $("lapCounterText").textContent =
+      `Lap ${state.auto_lap_current}/${state.auto_lap_total} — ${state.auto_lap_points} pts (Flight Endurance)`;
+  } else {
+    railLapCounter.style.display = "none";
+  }
 
   if (state.cam_active && camImg.getAttribute("src") !== "/video_feed") {
     camImg.src = "/video_feed";
@@ -477,6 +492,15 @@ btnGuidedBackup.addEventListener("click", () => {
   postJson("/api/mission/start_guided_backup", {});
 });
 
+btnMute.addEventListener("click", () => {
+  if (state.muted) {
+    postJson("/api/mission/unmute", {});
+  } else {
+    if (!confirm("Mute the website? It will send NO further commands (Abort/RTL still always works) until you Unmute.")) return;
+    postJson("/api/mission/mute", {});
+  }
+});
+
 function showPostLapModal(searchAvailable) {
   const modal = $("postLapModal");
   if (modal.style.display === "flex") return;   // already shown
@@ -491,6 +515,21 @@ $("btnGoHome").addEventListener("click", () => {
 $("btnGoSearch").addEventListener("click", () => {
   $("postLapModal").style.display = "none";
   postJson("/api/mission/post_lap_choice", { choice: "search" });
+});
+
+function showAutoStoppedModal(reason) {
+  const modal = $("autoStoppedModal");
+  if (modal.style.display === "flex") return;   // already shown
+  $("autoStoppedReason").textContent = `Reason reported: ${reason || "unknown"}`;
+  modal.style.display = "flex";
+}
+$("btnAutoStoppedContinue").addEventListener("click", () => {
+  $("autoStoppedModal").style.display = "none";
+  postJson("/api/mission/auto_stopped_choice", { choice: "continue" });
+});
+$("btnAutoStoppedGuided").addEventListener("click", () => {
+  $("autoStoppedModal").style.display = "none";
+  postJson("/api/mission/auto_stopped_choice", { choice: "guided" });
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -558,29 +597,42 @@ function renderChecklist(data) {
   btnStart.disabled = state.mission_running || (state.conn_active && !checklistReady);
 
   const counts = { pass: 0, fail: 0, warn: 0, waiting: 0 };
-  checklistRows.innerHTML = "";
-  for (const r of data.results) {
-    counts[r.status] = (counts[r.status] || 0) + 1;
-    const row = document.createElement("div");
-    row.className = `cl-row ${r.status}`;
-    const label = { pass: "PASS", fail: "FAIL", warn: r.overridden ? "OVERRIDDEN" : "WARN", waiting: "WAITING" }[r.status];
-    const overrideCell = r.can_override
-      ? `<label style="cursor:pointer;"><input type="checkbox" class="cl-override" data-name="${r.name}" ${r.overridden ? "checked" : ""} ${data.engineering_mode ? "" : "disabled"}> Override</label>`
-      : `<span class="muted small">locked</span>`;
-    row.innerHTML = `
-      <span class="cl-status ${r.status}">${label}</span>
-      <span>${r.name}</span>
-      <span class="cl-current">${r.current_value || "-"}</span>
-      <span class="cl-required">${r.required_value || "-"}</span>
-      <span>${overrideCell}</span>
-      <span class="cl-details">${r.reason || r.recommendation || ""}</span>`;
-    checklistRows.appendChild(row);
-  }
-  for (const cb of checklistRows.querySelectorAll(".cl-override")) {
-    cb.addEventListener("change", (e) => {
-      const ok = toggleOverride(e.target.dataset.name, e.target.checked);
-      if (!ok) e.target.checked = false;
-    });
+  try {
+    // Build into a detached fragment first -- only swap it into the live
+    // table once the ENTIRE build succeeds. Previously this cleared
+    // checklistRows immediately, so any exception partway through the
+    // loop (a malformed field, an unexpected value) left the table
+    // blank until the next successful update instead of just skipping
+    // this one render and keeping the last-good rows visible.
+    const fragment = document.createDocumentFragment();
+    for (const r of data.results) {
+      counts[r.status] = (counts[r.status] || 0) + 1;
+      const row = document.createElement("div");
+      row.className = `cl-row ${r.status}`;
+      const label = { pass: "PASS", fail: "FAIL", warn: r.overridden ? "OVERRIDDEN" : "WARN", waiting: "WAITING" }[r.status];
+      const overrideCell = r.can_override
+        ? `<label style="cursor:pointer;"><input type="checkbox" class="cl-override" data-name="${r.name}" ${r.overridden ? "checked" : ""} ${data.engineering_mode ? "" : "disabled"}> Override</label>`
+        : `<span class="muted small">locked</span>`;
+      row.innerHTML = `
+        <span class="cl-status ${r.status}">${label}</span>
+        <span>${r.name}</span>
+        <span class="cl-current">${r.current_value || "-"}</span>
+        <span class="cl-required">${r.required_value || "-"}</span>
+        <span>${overrideCell}</span>
+        <span class="cl-details">${r.reason || r.recommendation || ""}</span>`;
+      fragment.appendChild(row);
+    }
+    checklistRows.innerHTML = "";
+    checklistRows.appendChild(fragment);
+    for (const cb of checklistRows.querySelectorAll(".cl-override")) {
+      cb.addEventListener("change", (e) => {
+        const ok = toggleOverride(e.target.dataset.name, e.target.checked);
+        if (!ok) e.target.checked = false;
+      });
+    }
+  } catch (e) {
+    console.error("[CHECKLIST] Render failed, keeping previous rows visible:", e);
+    return;   // don't touch the summary counts either -- leave everything as it was
   }
 
   clPassed.textContent = `Passed: ${counts.pass}`;

@@ -114,8 +114,16 @@ class MissionController:
         self.status_listener_thread = None
         self.status_listener_running = False
         self.pi_link_uri = None   # None -> Pi commands go via self.conn (normal, one Pixhawk)
+        self._conn_close_lock = threading.Lock()   # guards against multiple threads (Abort,
+                                                     # a mission ending naturally, manual
+                                                     # Disconnect) all racing to close/null
+                                                     # self.conn independently
         self.skip_laps_event = threading.Event()
         self.guided_backup_event = threading.Event()
+        self.muted = threading.Event()   # operator wants full manual control via
+                                          # Mission Planner -- website initiates
+                                          # NOTHING while set (except Abort/RTL,
+                                          # which always works regardless)
 
         # Pre-flight safety checklist
         self.telemetry = {}             # populated from real MAVLink messages, see _on_telemetry_message()
@@ -141,6 +149,8 @@ class MissionController:
         self.continue_ev = threading.Event()
         self.post_lap_choice = None
         self.post_lap_ev = threading.Event()
+        self.auto_stopped_choice = None
+        self.auto_stopped_ev = threading.Event()
 
         # snapshot state for clients that (re)connect mid-mission
         self.state = {
@@ -151,8 +161,14 @@ class MissionController:
             "awaiting_continue": False,
             "awaiting_post_lap": False,
             "search_available": False,
+            "awaiting_auto_stopped": False,
+            "auto_stopped_reason": "",
+            "auto_lap_current": 0,
+            "auto_lap_total": 0,
+            "auto_lap_points": 0,
             "click_to_fly_enabled": False,
             "click_mode": "pin",
+            "muted": False,
             "status_text": "Ready",
             "status_level": "info",
             "armed": False,
@@ -512,7 +528,12 @@ class MissionController:
             self.telemetry.update({
                 "gps_ts": now,
                 "gps_fix_type": msg.fix_type,
-                "satellites_visible": msg.satellites_visible,
+                # 255 is GPS_RAW_INT's own documented "unknown" sentinel for
+                # this field -- treating it as a real count would silently
+                # pass any satellite-count safety check, exactly the same
+                # class of bug HDOP's 65535 sentinel already guards against
+                # below, just previously missed for this field.
+                "satellites_visible": msg.satellites_visible if msg.satellites_visible != 255 else 0,
                 "hdop": (msg.eph / 100.0) if msg.eph not in (65535, -1) else 99.0,
             })
 
@@ -686,6 +707,35 @@ class MissionController:
         self._push_state()
         self.post_lap_ev.set()
 
+    def _ask_auto_stopped_choice(self, reason: str) -> str:
+        """AUTO ended for some reason other than an explicit Start-as-Guided
+        press (abort, failsafe, RC override, anything). Rather than the
+        website guessing what to do -- which is exactly what caused it to
+        fight an operator's own Abort/RTL before -- this puts the decision
+        explicitly to the operator: switch to GUIDED and continue the
+        remaining laps, or leave the vehicle alone entirely and move on
+        (the operator is presumably flying it manually from here).
+        """
+        self.auto_stopped_ev.clear()
+        self.auto_stopped_choice = None
+        with self.lock:
+            self.state["awaiting_auto_stopped"] = True
+            self.state["auto_stopped_reason"] = reason
+        self._push_state()
+        self._log(f"[MAIN] AUTO stopped ({reason}) -- waiting for your decision: "
+                 f"switch to GUIDED and continue the laps, or continue anyway "
+                 f"(handle it yourself via Mission Planner/RC).", "warn")
+        self.auto_stopped_ev.wait()
+        return self.auto_stopped_choice or "continue"
+
+    def choose_auto_stopped(self, choice: str):
+        """choice: 'guided' or 'continue'"""
+        self.auto_stopped_choice = choice
+        with self.lock:
+            self.state["awaiting_auto_stopped"] = False
+        self._push_state()
+        self.auto_stopped_ev.set()
+
     def _ask_post_lap_choice(self, search_available: bool) -> str:
         self.post_lap_ev.clear()
         self.post_lap_choice = None
@@ -696,6 +746,26 @@ class MissionController:
         self._log("[MAIN] Laps complete — choose Return Home or Go to Search Area.", "info")
         self.post_lap_ev.wait()
         return self.post_lap_choice or "home"
+
+    def _safe_close_conn(self):
+        """Idempotent, race-safe connection teardown. Multiple independent
+        code paths can try to close self.conn at once -- Abort's own
+        thread, a mission ending naturally on its own, manual Disconnect.
+        With no coordination between them, one thread closing the
+        connection while another is still using it (or also closing it)
+        raises a raw socket error ("not a socket") that looks like a
+        crash but is really just this unguarded race. Every close() in
+        this file should go through here instead of calling conn.close()
+        directly.
+        """
+        with self._conn_close_lock:
+            conn = self.conn
+            self.conn = None
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass   # already closed by a racing thread -- exactly what this guards against
 
     # ── abort ────────────────────────────────────────────────────
     def abort(self):
@@ -712,11 +782,7 @@ class MissionController:
                 except Exception as e:
                     self._log(f"[ABORT] RTL error: {e}", "error")
                 finally:
-                    try:
-                        conn.close()
-                    except Exception as e:
-                        self._log(f"[ABORT] Error closing connection: {e}", "warn")
-                    self.conn = None
+                    self._safe_close_conn()
                     self.stop_status_listener()
                     with self.lock:
                         self.state["mission_running"] = False
@@ -766,11 +832,7 @@ class MissionController:
         if self.mission_thread is not None and self.mission_thread.is_alive():
             self._log("[CONN] A mission is running — use Abort instead of Disconnect.", "warn")
             return
-        try:
-            self.conn.close()
-        except Exception as e:
-            self._log(f"[CONN] Error closing connection: {e}", "warn")
-        self.conn = None
+        self._safe_close_conn()
         self.click_to_fly_enabled = False
         self.stop_status_listener()
         with self.lock:
@@ -852,6 +914,9 @@ class MissionController:
                 self._log("[CLICK] Click-to-fly is locked until the mapping/search line "
                          "finishes -- switch to Pin mode, or wait.", "warn")
                 return
+            if self.muted.is_set():
+                self._log("[CLICK] Website is muted -- click-to-fly blocked. Unmute to resume.", "warn")
+                return
             from flight import fly_to_clicked_point
             threading.Thread(target=fly_to_clicked_point,
                              args=(self.conn, px, py, w, h), daemon=True).start()
@@ -891,68 +956,110 @@ class MissionController:
             pin["distance_m"] = round(distance_m(cur_lat, cur_lon, pin["lat"], pin["lon"]), 1)
         self._emit_pins()
 
-    def _observe_auto_laps(self, conn, auto_mode_id, after_laps_idx) -> bool:
+    def _lap_points(self, completed_laps: int) -> float:
+        """Flight Endurance lap-scoring term, per the team's own stated
+        understanding of the SUAS 2026 rules: 200 * (N_L/10)^2, where N_L
+        is completed laps (max 10). Quadratic -- each additional lap is
+        worth more than the last, which is why the team's strategy
+        prioritizes completing all 10 over any partial count."""
+        n = max(0, min(10, completed_laps))
+        return round(200.0 * (n / 10.0) ** 2, 1)
+
+    def _observe_auto_laps(self, conn, auto_mode_id, first_lap_idx, after_laps_idx, total_laps) -> tuple:
         """Purely observational -- never touches mode, mission-current, or
         anything else. The operator is manually driving AUTO; this just
         watches MISSION_CURRENT to know when the lap sequence is done.
-        Returns True if it reached the post-laps item while still in AUTO
-        (laps genuinely complete), False if it should fall back to the
-        GUIDED backup path (operator override, or AUTO dropped out
-        unexpectedly) -- the caller handles the GUIDED fallback itself.
+
+        Returns (outcome, reason):
+          ("complete", None)         -- reached the post-laps item while still in AUTO
+          ("guided_backup", None)    -- operator explicitly pressed Start as Guided Mode
+          ("stopped", reason)        -- AUTO ended any other way (abort, failsafe, RC
+                                        mode change, anything). The website does NOT
+                                        guess what this means or take over automatically
+                                        -- the caller puts an explicit choice to the
+                                        operator instead. A silent guess here is exactly
+                                        what previously caused the website to fight an
+                                        operator's own Abort/RTL by immediately
+                                        re-commanding GUIDED under it.
         """
+        # Real lap count, not just raw mission-item index -- each lap has
+        # the SAME number of items (waypoints plus any altitude-change
+        # inserts), since the identical waypoint sequence repeats every
+        # lap, so this division is exact.
+        items_per_lap = max(1, (after_laps_idx - first_lap_idx) // total_laps)
+
         last_seq = None
         last_statustext = None
         while True:
             if self.skip_laps_event.is_set():
                 self._log("[MAIN] Skip requested during AUTO -- taking over in GUIDED.", "warn")
-                return False
+                return "guided_backup", None
             if self.guided_backup_event.is_set():
                 self._log("[MAIN] Backup requested during AUTO -- taking over in GUIDED.", "warn")
-                return False
+                return "guided_backup", None
 
             msg = conn.recv_match(type=["HEARTBEAT", "MISSION_CURRENT", "STATUSTEXT"],
                                   blocking=True, timeout=2)
             if msg is None:
                 continue
             if msg.get_type() == "STATUSTEXT":
-                # Capture whatever the FC broadcasts right around a mode
-                # change -- failsafe messages ("EKF Failsafe", "Radio
-                # Failsafe", "Battery Failsafe", etc.) show up this way.
-                # Keeping the last one seen means if AUTO drops out on the
-                # very next HEARTBEAT, we can report WHY instead of just
-                # "left unexpectedly" with no explanation.
                 text = (msg.text or "").rstrip("\x00")
                 if text:
                     last_statustext = text
                 continue
             if msg.get_type() == "HEARTBEAT":
                 if msg.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
-                    # This link carries HEARTBEATs from more than just the
-                    # vehicle (Mission Planner's own GCS presence heartbeat,
-                    # etc) -- those report MAV_AUTOPILOT_INVALID since they
-                    # aren't a flight controller and have no real flight
-                    # mode. Treating one of these as "the vehicle changed
-                    # mode" is exactly what caused a false "left AUTO"
-                    # detection here before.
                     continue
                 if msg.custom_mode != auto_mode_id:
-                    reason = f" -- last FC message: \"{last_statustext}\"" if last_statustext else \
-                             " -- no STATUSTEXT seen to explain why"
-                    self._log(f"[MAIN] Vehicle left AUTO unexpectedly{reason} -- "
-                             f"taking over in GUIDED.", "warn")
-                    return False
+                    reason = last_statustext or "no STATUSTEXT seen to explain why"
+                    return "stopped", reason
                 continue
             # MISSION_CURRENT
             if msg.seq != last_seq:
                 last_seq = msg.seq
-                self._log(f"[MAIN] AUTO progress -- mission item {msg.seq}", "info")
+                current_lap = min(total_laps, max(1, (msg.seq - first_lap_idx) // items_per_lap + 1))
+                completed_laps = current_lap - 1
+                points = self._lap_points(completed_laps)
+                self._log(f"[MAIN] AUTO progress -- Lap {current_lap}/{total_laps} "
+                         f"(item {msg.seq}) -- Flight Endurance so far: {points} pts "
+                         f"({completed_laps} completed laps)", "info")
+                with self.lock:
+                    self.state["auto_lap_current"] = current_lap
+                    self.state["auto_lap_total"] = total_laps
+                    self.state["auto_lap_points"] = points
+                self._push_state()
             if msg.seq >= after_laps_idx:
-                self._log("[MAIN] Reached the end of the lap sequence under AUTO.", "ok")
-                return True
+                self._log(f"[MAIN] Reached the end of the lap sequence under AUTO -- "
+                         f"Flight Endurance: {self._lap_points(total_laps)} pts "
+                         f"({total_laps} completed laps).", "ok")
+                with self.lock:
+                    self.state["auto_lap_current"] = total_laps
+                    self.state["auto_lap_points"] = self._lap_points(total_laps)
+                self._push_state()
+                return "complete", None
+
+    def mute_control(self):
+        self.muted.set()
+        self._log("[MUTE] Website control MUTED -- sending no further commands. "
+                 "Full control is yours via Mission Planner/RC. Press Unmute to "
+                 "let the website resume.", "warn")
+        with self.lock:
+            self.state["muted"] = True
+        self._push_state()
+
+    def unmute_control(self):
+        self.muted.clear()
+        self._log("[MUTE] Website control unmuted -- resuming wherever it left off.", "ok")
+        with self.lock:
+            self.state["muted"] = False
+        self._push_state()
 
     def start_guided_backup(self):
         if not (self.mission_thread and self.mission_thread.is_alive()):
             self._log("[MAIN] No mission running to start.", "warn")
+            return
+        if self.muted.is_set():
+            self._log("[MAIN] Website is muted -- unmute before requesting GUIDED backup.", "warn")
             return
         self.guided_backup_event.set()
         self._log("[MAIN] Guided backup requested.", "warn")
@@ -960,6 +1067,9 @@ class MissionController:
     def skip_to_search(self):
         if not (self.mission_thread and self.mission_thread.is_alive()):
             self._log("[MAIN] No mission running to skip.", "warn")
+            return
+        if self.muted.is_set():
+            self._log("[MAIN] Website is muted -- skip request blocked. Unmute to resume.", "warn")
             return
         self.skip_laps_event.set()
         self._log("[MAIN] Skip requested -- ending laps early, heading to the search/mapping line.", "warn")
@@ -1002,6 +1112,9 @@ class MissionController:
         if self.conn is None:
             self._log("[PIN] Not connected.", "error")
             return
+        if self.muted.is_set():
+            self._log("[PIN] Website is muted -- fly-to-pin blocked. Unmute to resume.", "warn")
+            return
         pin = next((p for p in self.pins if p["id"] == pin_id), None)
         if pin is None:
             self._log(f"[PIN] No such pin: {pin_id}", "error")
@@ -1010,21 +1123,28 @@ class MissionController:
         self._log(f"[PIN] Flying to {pin['name']} @ {pin['lat']:.7f},{pin['lon']:.7f}", "info")
         threading.Thread(target=fly_to,
                          args=(self.conn, pin["lat"], pin["lon"], self.mission_alt),
+                         kwargs={"mute_event": self.muted},
                          daemon=True).start()
 
     def fly_route(self, order: list):
         if self.conn is None:
             self._log("[ROUTE] Not connected.", "error")
             return
+        if self.muted.is_set():
+            self._log("[ROUTE] Website is muted -- route flight blocked. Unmute to resume.", "warn")
+            return
 
         def _run():
             from flight import fly_to
             for pin_id in order:
+                if self.muted.is_set():
+                    self._log("[ROUTE] Muted mid-route -- stopping here (not fighting manual control).", "warn")
+                    return
                 pin = next((p for p in self.pins if p["id"] == pin_id), None)
                 if pin is None:
                     continue
                 self._log(f"[ROUTE] → {pin['name']}", "info")
-                fly_to(self.conn, pin["lat"], pin["lon"], self.mission_alt)
+                fly_to(self.conn, pin["lat"], pin["lon"], self.mission_alt, mute_event=self.muted)
             self._log("[ROUTE] Route complete. Use RTL/Abort to return home.", "ok")
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1032,6 +1152,9 @@ class MissionController:
     def set_altitude(self, alt: float):
         if self.conn is None:
             self._log("[ALT] Not connected.", "error")
+            return
+        if self.muted.is_set():
+            self._log("[ALT] Website is muted -- altitude change blocked. Unmute to resume.", "warn")
             return
 
         def _run():
@@ -1043,7 +1166,7 @@ class MissionController:
             lat, lon = pos.lat / 1e7, pos.lon / 1e7
             self._log(f"[ALT] Changing altitude to {alt:.1f}m (position unchanged)", "info")
             from flight import fly_to
-            fly_to(self.conn, lat, lon, alt)
+            fly_to(self.conn, lat, lon, alt, mute_event=self.muted)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1077,6 +1200,9 @@ class MissionController:
         with self.lock:
             self.state["mission_running"] = True
             self.state["click_mode"] = "pin"
+            self.state["auto_lap_current"] = 0
+            self.state["auto_lap_total"] = 0
+            self.state["auto_lap_points"] = 0
         self._push_state()
         self._set_status("Running…", "warn")
         self.mission_thread = threading.Thread(target=self._run, args=(params,), daemon=True)
@@ -1187,7 +1313,7 @@ class MissionController:
             # mission or switches modes -- set automatically either way.
             self._log("[MAIN] Yaw behavior -> never change (laps)", "info")
             set_param(conn, "WP_YAW_BEHAVIOR", cfg.WP_YAW_BEHAVIOR_LAPS)
-            set_param(conn, "WPNAV_SPEED", cfg.LAP_SPEED_MS * 100)
+            set_param(conn, "WP_SPD", cfg.LAP_SPEED_MS)
             set_speed(conn, cfg.LAP_SPEED_MS)
 
             # Wait for the operator to either (a) manually upload the
@@ -1200,24 +1326,55 @@ class MissionController:
             self._log("[MAIN] Waiting for manual AUTO switch (Mission Planner) or "
                      "the 'Start as Guided Mode' backup button...", "info")
             auto_mode_id = conn.mode_mapping().get("AUTO")
-            auto_flew_laps = False
+            want_guided = False
             while True:
                 if self.guided_backup_event.is_set():
                     self._log("[MAIN] Backup requested -- flying laps in GUIDED.", "warn")
+                    want_guided = True
                     break
                 msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=2)
                 if (msg is not None and msg.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
                         and msg.custom_mode == auto_mode_id):
                     self._log("[MAIN] AUTO engaged manually -- monitoring progress "
                              "(not driving it).", "ok")
-                    auto_flew_laps = self._observe_auto_laps(conn, auto_mode_id, after_laps_idx)
-                    break
+                    outcome, reason = self._observe_auto_laps(conn, auto_mode_id, first_lap_idx,
+                                                              after_laps_idx, params.laps)
+                    if outcome == "complete":
+                        want_guided = False
+                        break
+                    elif outcome == "guided_backup":
+                        want_guided = True
+                        break
+                    else:   # "stopped" -- AUTO ended some other way (abort,
+                            # failsafe, RC override, anything). Put the
+                            # decision explicitly to the operator rather
+                            # than guessing or silently waiting -- this is
+                            # exactly the "serious situation" call that
+                            # should never be made automatically.
+                        decision = self._ask_auto_stopped_choice(reason)
+                        want_guided = (decision == "guided")
+                        if want_guided:
+                            self._log("[MAIN] Operator chose: switch to GUIDED and "
+                                     "continue laps.", "warn")
+                        else:
+                            self._log("[MAIN] Operator chose: continue anyway -- website "
+                                     "will not touch flight mode, moving on.", "warn")
+                        break
 
-            if not auto_flew_laps:
+            if want_guided:
                 set_mode(conn, "GUIDED")
                 try:
                     for lap in range(1, params.laps + 1):
-                        self._log(f"[MAIN] — Lap {lap}/{params.laps} (GUIDED) —", "info")
+                        completed_laps = lap - 1
+                        points = self._lap_points(completed_laps)
+                        self._log(f"[MAIN] — Lap {lap}/{params.laps} (GUIDED) -- "
+                                 f"Flight Endurance so far: {points} pts "
+                                 f"({completed_laps} completed laps) —", "info")
+                        with self.lock:
+                            self.state["auto_lap_current"] = lap
+                            self.state["auto_lap_total"] = params.laps
+                            self.state["auto_lap_points"] = points
+                        self._push_state()
                         prev = params.mission_alt
                         for i, wp in enumerate(params.waypoints, 1):
                             # Checked BETWEEN waypoints, not mid-flight --
@@ -1228,12 +1385,20 @@ class MissionController:
                             # moving.
                             if self.skip_laps_event.is_set():
                                 raise FlightCancelled("skip requested between waypoints")
+                            if self.muted.is_set():
+                                self._log("[MAIN] Muted -- pausing between waypoints, "
+                                         "starting nothing new until unmuted.", "warn")
+                                while self.muted.is_set():
+                                    time.sleep(0.5)
+                                self._log("[MAIN] Unmuted -- resuming laps.", "ok")
                             lat, lon, alt = wp
                             if abs(alt - prev) > 0.5:
                                 self._log(f"[MAIN] Alt {prev:.1f}->{alt:.1f} m", "info")
-                                if not fly_to(conn, lat, lon, alt, radius=cfg.LAP_ACCEPT_RADIUS_M):
+                                if not fly_to(conn, lat, lon, alt, radius=cfg.LAP_ACCEPT_RADIUS_M,
+                                             mute_event=self.muted):
                                     raise TimeoutError(f"Alt-adjust timeout lap {lap} WP {i}")
-                            if not fly_to(conn, lat, lon, alt, radius=cfg.LAP_ACCEPT_RADIUS_M):
+                            if not fly_to(conn, lat, lon, alt, radius=cfg.LAP_ACCEPT_RADIUS_M,
+                                         mute_event=self.muted):
                                 raise TimeoutError(f"Timeout lap {lap} WP {i}")
                             prev = alt
                 except FlightCancelled:
@@ -1282,7 +1447,7 @@ class MissionController:
                 # the altitude transition to the search pass's own altitude
                 # happens naturally as part of the first real leg below.
                 self._log("[SEARCH] Holding position to settle before starting the pass...", "info")
-                fly_to(conn, cur_lat, cur_lon, cur_alt, timeout=15)
+                fly_to(conn, cur_lat, cur_lon, cur_alt, timeout=15, mute_event=self.muted)
 
                 # Fly to whichever end is actually closer to the drone's
                 # CURRENT position (not a fixed geometric end), avoiding
@@ -1294,17 +1459,6 @@ class MissionController:
                     self._log(f"[SEARCH] Reversed pass direction -- closer entry point "
                              f"({d_to_last:.0f}m vs {d_to_first:.0f}m) from current position.", "info")
 
-                # Search/mapping pass: face the next waypoint, fly slower
-                # for stable video, rather than the laps' never-change-yaw
-                # + max-speed behavior.
-                self._log("[SEARCH] Yaw behavior -> face next waypoint", "info")
-                set_param(conn, "WP_YAW_BEHAVIOR", cfg.WP_YAW_BEHAVIOR_SEARCH)
-                # DO_CHANGE_SPEED alone wasn't reliably taking effect for
-                # GUIDED position-target navigation -- also set WPNAV_SPEED
-                # directly (cm/s) as a second, more authoritative path.
-                set_param(conn, "WPNAV_SPEED", cfg.SEARCH_SPEED_MS * 100)
-                set_speed(conn, cfg.SEARCH_SPEED_MS)
-
                 self._log("[SEARCH] Starting camera feed...", "info")
                 threading.Thread(target=self.start_camera, daemon=True).start()
 
@@ -1312,11 +1466,9 @@ class MissionController:
                 for i, (lat, lon, alt) in enumerate(path, 1):
                     self._log(f"[SEARCH] Leg {i}/{len(path)}", "info")
 
-                    if i == 1:
-                        # Trigger on COMMENCEMENT of the entry leg, not arrival —
-                        # the command's travel time then overlaps with the flight
-                        # time to get there, instead of stacking as dead time
-                        # after arrival.
+                    if i == 1 and len(path) <= 1:
+                        # Edge case: no real entry-vs-traverse distinction to
+                        # make with only one point, so just start here.
                         self.send_text_command(config.CMD_RECORD_START,
                                               "Auto: Start Recording (mapping pass)")
 
@@ -1330,9 +1482,36 @@ class MissionController:
                             f"[SEARCH] Approaching pass exit (~{d:.0f}m) — recording will stop soon.",
                             "info")
 
+                    # Leg 1 (getting TO the entry point) still flies at full
+                    # speed, no-yaw-face -- unchanged from the laps settings.
+                    # Only once actually starting the real map-line traverse
+                    # (leg 2 onward) does the search-specific slow/yaw-face
+                    # behavior apply, switched right below after leg 1 lands.
                     if not fly_to(conn, lat, lon, alt, near_cb=near_cb,
-                                  position_cb=self._on_mapping_position):
+                                  position_cb=self._on_mapping_position, mute_event=self.muted):
                         raise TimeoutError(f"Search leg {i} timeout")
+
+                    if i == 1 and len(path) > 1:
+                        self._log("[SEARCH] Entry reached -- now starting the map line: "
+                                 "yaw -> face next waypoint, speed -> "
+                                 f"{cfg.SEARCH_SPEED_MS:.0f} m/s", "info")
+                        set_param(conn, "WP_YAW_BEHAVIOR", cfg.WP_YAW_BEHAVIOR_SEARCH)
+                        # DO_CHANGE_SPEED alone wasn't reliably taking effect for
+                        # GUIDED position-target navigation -- also set the WP
+                        # speed parameter directly as a second, more authoritative
+                        # path. Confirmed via the actual live SITL parameter list
+                        # that this firmware calls it WP_SPD, in plain m/s -- not
+                        # the older WPNAV_SPEED/cm-based name this used to send.
+                        set_param(conn, "WP_SPD", cfg.SEARCH_SPEED_MS)
+                        set_speed(conn, cfg.SEARCH_SPEED_MS)
+                        # Trigger on COMMENCEMENT of the real map-line traverse,
+                        # not arrival at the exit -- the command's travel time
+                        # then overlaps with the flight time to fly the pass,
+                        # instead of stacking as dead time after arrival. This
+                        # now correctly aligns with the actual survey leg
+                        # rather than the fast transit to get here.
+                        self.send_text_command(config.CMD_RECORD_START,
+                                              "Auto: Start Recording (mapping pass)")
 
                     if i == len(path):
                         # No further leg to hide this behind, so this one is
@@ -1343,6 +1522,16 @@ class MissionController:
 
                 self._log("[SEARCH] Mapping complete ✓", "ok")
                 self.mapping_exit_point = (path[-1][0], path[-1][1])
+
+                # Reset yaw/speed back to full-speed, no-yaw-face -- ONCE,
+                # here, rather than re-setting it on every subsequent click
+                # or pin flight. Everything from this point on (click-to-fly,
+                # fly-to-pin, fly-route) happens after this line, so it's
+                # already correct by the time any of them can run.
+                self._log("[MAIN] Yaw behavior -> never change, speed -> full (post-mapping)", "info")
+                set_param(conn, "WP_YAW_BEHAVIOR", cfg.WP_YAW_BEHAVIOR_LAPS)
+                set_param(conn, "WP_SPD", cfg.LAP_SPEED_MS)
+                set_speed(conn, cfg.LAP_SPEED_MS)
 
                 self._enable_click_to_fly()
                 self._log("[MAIN] Click the Camera Feed tab to fly to a marked object's real "
@@ -1369,12 +1558,7 @@ class MissionController:
             with self.lock:
                 self.state["awaiting_continue"] = False
             if not manual_handoff:
-                if self.conn is not None:
-                    try:
-                        self.conn.close()
-                    except Exception as e:
-                        self._log(f"[MAIN] Error closing connection: {e}", "warn")
-                self.conn = None
+                self._safe_close_conn()
                 self.stop_status_listener()
                 with self.lock:
                     self.state["mission_running"] = False
